@@ -103,13 +103,52 @@ static bool url_is_supported(const char *url)
         && (strncmp(url, "http://", 7) == 0 || url_is_https(url));
 }
 
+// Copies a URL with any embedded credentials removed, for logging.
+//
+// A source that needs authentication is configured as
+// https://user:password@host/path, which is the only way this tool can carry
+// credentials at all. Logging that verbatim would write the password to
+// sdmc:/switch/nx-nexus/nx-nexus.log, where it survives, gets copied off the
+// card, and gets pasted into bug reports.
+void nexusHttpRedactUrl(const char *url, char *out, size_t out_size)
+{
+    if (out == NULL || out_size == 0) return;
+    out[0] = '\0';
+    if (url == NULL) return;
+
+    const char *scheme_end = strstr(url, "://");
+    const char *at = NULL;
+
+    if (scheme_end != NULL) {
+        // Only userinfo counts: an '@' later in the path is not a credential,
+        // so the search stops at the first '/' after the scheme.
+        const char *host = scheme_end + 3;
+        const char *slash = strchr(host, '/');
+
+        for (const char *p = host; *p != '\0' && (slash == NULL || p < slash); p++) {
+            if (*p == '@') { at = p; break; }
+        }
+    }
+
+    if (at == NULL) {
+        snprintf(out, out_size, "%.*s", (int)(out_size - 1), url);
+        return;
+    }
+
+    const size_t prefix = (size_t)(scheme_end + 3 - url);
+    snprintf(out, out_size, "%.*s<credentials>@%s",
+             (int)prefix, url, at + 1);
+}
+
 // Applies the shared options: timeouts, redirects and TLS policy.
 static NexusHttpResult apply_common(CURL *curl, const char *url)
 {
     if (!url_is_supported(url)) return NexusHttp_BadUrl;
 
     if (url_is_https(url) && !g_have_ca && !g_insecure) {
-        LOG_E("http: refusing HTTPS to %.60s -- no CA bundle and insecure mode is off", url);
+        char safe[128];
+        nexusHttpRedactUrl(url, safe, sizeof(safe));
+        LOG_E("http: refusing HTTPS to %.90s -- no CA bundle and insecure mode is off", safe);
         return NexusHttp_NoTlsTrust;
     }
 

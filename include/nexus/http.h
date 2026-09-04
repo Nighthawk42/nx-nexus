@@ -59,6 +59,13 @@ bool nexusHttpGetInsecure(void);
 /// unavailable rather than just failing.
 bool nexusHttpHasCaBundle(void);
 
+/// Copies a URL into out with any embedded credentials replaced by
+/// "<credentials>". A source needing authentication is configured as
+/// https://user:password@host/path, so anything that logs or displays a URL
+/// must go through this first -- the log file outlives the session and gets
+/// pasted into bug reports.
+void nexusHttpRedactUrl(const char *url, char *out, size_t out_size);
+
 /// Streams a URL into sink. status_out receives the HTTP status when non-NULL.
 NexusHttpResult nexusHttpGet(const char *url, NexusHttpSink sink, void *sink_user,
                              NexusHttpProgress progress, void *progress_user,

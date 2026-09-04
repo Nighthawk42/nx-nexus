@@ -24,3 +24,4 @@ desktop.ini
 # Host test artifacts
 /tests/nexus-tests
 /tests/obj/
+*.zip
