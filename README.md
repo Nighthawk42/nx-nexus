@@ -35,6 +35,7 @@
   cannot corrupt a live save
 - **Reads raw NAND partitions** of whichever MMC you booted from
 - **Installs from your own server** over HTTPS, and can update itself
+- **Installs system firmware — emuMMC only**, refused outright on sysMMC
 - **No keys, anywhere.** NCAs are never decrypted by this tool
 
 ## Stores

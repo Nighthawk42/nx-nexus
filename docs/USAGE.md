@@ -140,6 +140,51 @@ checked automatically. The download lands on a scratch name, is verified to
 actually be an NRO before replacing the running one, and the previous build is
 kept as `NX-Nexus.nro.bak`.
 
+## Installing firmware
+
+**This is only offered when the console booted from an emuMMC.** On sysMMC the
+feature is visible but blocked, and says so.
+
+That gate is the whole reason the feature exists in this shape. A firmware
+install that goes wrong on sysMMC leaves a console that will not boot and
+cannot easily be repaired from the console itself. The same failure on an
+emuMMC is an inconvenience: sysMMC still boots, and the emuMMC can be restored.
+
+Horizon mounts exactly one NAND, so "update the emuMMC" just means running this
+while booted into it — the content lands on whichever system partition is
+active.
+
+### Before you start
+
+**Back up your NAND.** Store 7 dumps the raw partitions, and a failed install is
+only recoverable from a backup. This is not boilerplate; it is the actual
+recovery path.
+
+Check the firmware is not newer than your Atmosphère supports. Content installs
+regardless, and an unsupported version will not boot.
+
+### Doing it
+
+1. Put a firmware folder (loose `.nca` files) at `sdmc:/firmware`
+2. **Install firmware** → **Scan**
+3. **I have a NAND backup — continue** (arms the install)
+4. **INSTALL FIRMWARE NOW**
+5. Reboot
+
+Arming is a separate step on purpose: the install is never one careless button
+press away.
+
+A sanity check refuses folders with fewer than 16 meta files — that is what
+pointing this at a game folder looks like, and installing a game as system
+content is not something to do by accident.
+
+Content is registered first and metadata second, so the system never briefly
+describes content that is not there. Any failure rolls the whole thing back.
+
+> **Untested on hardware.** This is the highest-risk operation in the tool and
+> it has not been run against a real system partition. Do not use it on
+> anything you cannot restore.
+
 ## Maintenance
 
 Interrupted installs leave placeholder files that were never registered. They

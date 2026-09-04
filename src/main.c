@@ -43,6 +43,7 @@
 #include "nexus/netinstall.h"
 #include "nexus/update.h"
 #include "nexus/maintenance.h"
+#include "nexus/firmware.h"
 
 #define WORKER_STACK_SIZE (64 * 1024)
 #define WORKER_PRIORITY   0x2C          // slightly above the default 0x2D
@@ -240,6 +241,7 @@ typedef enum {
     Screen_Items,
     Screen_Maintenance,
     Screen_Update,
+    Screen_Firmware,
     Screen_Log,
     Screen_About,
     Screen_Quit,
@@ -252,6 +254,7 @@ enum {
     Act_Sources,
     Act_Maintenance,
     Act_Update,
+    Act_Firmware,
     Act_Log,
     Act_About,
     Act_Quit,
@@ -264,6 +267,11 @@ enum {
     // Update actions.
     Act_Upd_Check = 200,
     Act_Upd_Apply,
+
+    // Firmware actions. Installing is deliberately two steps.
+    Act_Fw_Scan = 300,
+    Act_Fw_Arm,
+    Act_Fw_Install,
 
     // Source rows are Act_Source_Base + index; item rows are
     // Act_Item_Base + index.
@@ -279,6 +287,9 @@ static NexusSourceItem *g_items = NULL;
 static u32              g_item_count = 0;
 static int              g_source_index = -1;
 static char             g_action_msg[128] = "";
+static NexusFirmwareSet g_fw_set;
+static bool             g_fw_scanned = false;
+static bool             g_fw_armed = false;   // second-step confirmation
 
 
 // ---------------------------------------------------------------------------
@@ -452,6 +463,73 @@ static void draw_maintenance(const NexusMaintenanceReport *rep, bool scanned)
     }
 }
 
+
+static void build_firmware_menu(Menu *m)
+{
+    menuReset(m, 6);
+
+    menuAdd(m, Act_Fw_Scan, "Scan " NEXUS_FIRMWARE_DIR, "");
+
+    if (!nexusFirmwareInstallAllowed()) return;   // nothing else is offered
+
+    if (g_fw_scanned && g_fw_set.valid) {
+        if (!g_fw_armed) {
+            menuAdd(m, Act_Fw_Arm, "I have a NAND backup - continue", "");
+        } else {
+            menuAdd(m, Act_Fw_Install, "INSTALL FIRMWARE NOW", "irreversible");
+        }
+    }
+}
+
+static void draw_firmware(void)
+{
+    printf("\n");
+
+    if (!nexusFirmwareInstallAllowed()) {
+        printf("   " C_ERR "Blocked: this console booted from %s." C_RESET "\n\n",
+               nexusSysInfoStorageName());
+        printf("   " C_DIM "Firmware installation is only offered on an emuMMC." C_RESET "\n");
+        printf("   " C_DIM "A bad firmware install on sysMMC leaves a console that" C_RESET "\n");
+        printf("   " C_DIM "will not boot. On an emuMMC, sysMMC still boots and the" C_RESET "\n");
+        printf("   " C_DIM "emuMMC can be restored from a backup." C_RESET "\n\n");
+        printf("   " C_DIM "Boot into your emuMMC and run this again." C_RESET "\n");
+        return;
+    }
+
+    printf("   Target      " C_VALUE "%s system partition" C_RESET "\n",
+           nexusSysInfoStorageName());
+    printf("   Current fw  " C_VALUE "%s" C_RESET "\n\n",
+           nexusSysInfoFirmware()[0] != '\0' ? nexusSysInfoFirmware() : "unknown");
+
+    if (!g_fw_scanned) {
+        printf("   " C_DIM "Put a firmware folder at " NEXUS_FIRMWARE_DIR " and scan." C_RESET "\n\n");
+    } else if (!g_fw_set.valid) {
+        printf("   " C_ERR "%s" C_RESET "\n\n", g_fw_set.problem);
+    } else {
+        char total[24];
+        fmt_bytes(total, sizeof(total), g_fw_set.total_bytes);
+        printf("   Found       " C_VALUE "%u NCAs" C_RESET " (%u meta), %s\n\n",
+               g_fw_set.nca_count, g_fw_set.meta_count, total);
+
+        printf("   " C_WARN "Back up your NAND first." C_RESET " " C_DIM
+               "Store 7 dumps the raw" C_RESET "\n");
+        printf("   " C_DIM "partitions; a failed install is only recoverable from one."
+               C_RESET "\n\n");
+        printf("   " C_DIM "Do not power off during the install. Reboot afterwards."
+               C_RESET "\n\n");
+
+        if (g_fw_armed) {
+            printf("   " C_ERR "Armed. The next action writes to the system partition."
+                   C_RESET "\n\n");
+        }
+    }
+
+    const NexusFwProgress *pr = nexusFirmwareGetProgress();
+    if (pr->status[0] != '\0') {
+        printf("   Status      %s\n", pr->status);
+    }
+}
+
 static void build_main_menu(Menu *m)
 {
     menuReset(m, UI_BODY_ROWS);
@@ -479,6 +557,8 @@ static void build_main_menu(Menu *m)
     menuAddSpacer(m);
     menuAddHeading(m, "System");
     menuAdd(m, Act_Maintenance, "Maintenance",  "");
+    menuAdd(m, Act_Firmware,    "Install firmware",
+            nexusFirmwareInstallAllowed() ? "emuMMC" : "sysMMC - blocked");
     menuAdd(m, Act_Log,         "Log",          "");
     menuAdd(m, Act_About,       "About",        "");
 
@@ -695,11 +775,19 @@ int main(int argc, char *argv[])
                             screen = Screen_Update;
                             break;
 
+                        case Act_Firmware:
+                            g_action_msg[0] = 0;
+                            g_fw_armed = false;
+                            build_firmware_menu(&sub);
+                            screen = Screen_Firmware;
+                            break;
+
                         default: break;
                     }
                 }
             } else if (screen == Screen_Sources || screen == Screen_Items
-                       || screen == Screen_Maintenance || screen == Screen_Update) {
+                       || screen == Screen_Maintenance || screen == Screen_Update
+                       || screen == Screen_Firmware) {
 
                 if (down & (HidNpadButton_Up   | HidNpadButton_StickLUp))   menuMove(&sub, -1);
                 if (down & (HidNpadButton_Down | HidNpadButton_StickLDown)) menuMove(&sub, 1);
@@ -794,6 +882,43 @@ int main(int argc, char *argv[])
                                 build_update_menu(&sub);
                                 break;
 
+                            case Act_Fw_Scan:
+                                nexusFirmwareScan(NEXUS_FIRMWARE_DIR, &g_fw_set);
+                                g_fw_scanned = true;
+                                g_fw_armed   = false;
+                                // problem[] is longer than the message slot,
+                                // so bound it rather than let it truncate.
+                                snprintf(g_action_msg, sizeof(g_action_msg), "%.120s",
+                                         g_fw_set.valid ? "firmware set looks usable"
+                                                        : g_fw_set.problem);
+                                build_firmware_menu(&sub);
+                                break;
+
+                            case Act_Fw_Arm:
+                                // Arming is its own step so the install can
+                                // never be one careless button press away.
+                                g_fw_armed = true;
+                                snprintf(g_action_msg, sizeof(g_action_msg),
+                                         "armed - select again to install");
+                                build_firmware_menu(&sub);
+                                break;
+
+                            case Act_Fw_Install: {
+                                consoleClear();
+                                draw_header("Installing firmware");
+                                printf("\n   Writing to the %s system partition.\n",
+                                       nexusSysInfoStorageName());
+                                printf("   DO NOT POWER OFF.\n");
+                                consoleUpdate(NULL);
+
+                                const NexusFwResult fr = nexusFirmwareInstall(&g_fw_set);
+                                snprintf(g_action_msg, sizeof(g_action_msg), "%s",
+                                         nexusFwStr(fr));
+                                g_fw_armed = false;
+                                build_firmware_menu(&sub);
+                                break;
+                            }
+
                             case Act_Upd_Apply:
                                 consoleClear();
                                 draw_header("Update");
@@ -884,6 +1009,15 @@ int main(int argc, char *argv[])
                 case Screen_Update:
                     draw_header("Update");
                     draw_update();
+                    printf("\n");
+                    menuDraw(&sub);
+                    draw_message_block();
+                    draw_footer("[A] run   [B] back   [Up/Down] move");
+                    break;
+
+                case Screen_Firmware:
+                    draw_header("Firmware");
+                    draw_firmware();
                     printf("\n");
                     menuDraw(&sub);
                     draw_message_block();
