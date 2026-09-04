@@ -206,7 +206,10 @@ static void draw_rule(char edge)
 static void draw_header(const char *screen)
 {
     draw_rule('=');
-    printf(" " C_TITLE "NX-Nexus" C_RESET " " C_DIM "0.1.0-dev" C_RESET
+    // One source of truth: this is the same string the updater compares
+    // against a release tag, so the header can never disagree with what
+    // "Check for updates" thinks is installed.
+    printf(" " C_TITLE "NX-Nexus" C_RESET " " C_DIM NEXUS_VERSION C_RESET
            "   %-22s " C_DIM "%s | fw %s" C_RESET "\n",
            screen,
            nexusSysInfoStorageName(),

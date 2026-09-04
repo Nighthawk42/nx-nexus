@@ -21,7 +21,14 @@
 #include "nexus/sources.h"
 #include "nexus/log.h"
 
-#define MANIFEST_MAX 8192
+// A GitHub releases/latest document is much bigger than a hand-written
+// manifest: generated release notes plus a couple of assets runs well past
+// 8 KiB. Goldleaf's is 7.3 KiB with no generated notes at all, so the old
+// 8 KiB cap would have failed on the very first release with nothing more
+// helpful than "response too large".
+//
+// Heap rather than stack: 64 KiB is far more than a thread stack should carry.
+#define MANIFEST_MAX (64 * 1024)
 
 static NexusUpdateState g_state;
 
@@ -134,24 +141,39 @@ Result nexusUpdateCheck(void)
         return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
     }
 
-    char manifest[MANIFEST_MAX];
+    char *manifest = (char *)malloc(MANIFEST_MAX);
+    if (manifest == NULL) return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+
     size_t len = 0;
     long status = 0;
 
     const NexusHttpResult hr = nexusHttpGetBuffer(cfg->update_url, manifest,
-                                                  sizeof(manifest) - 1, &len, &status);
+                                                  MANIFEST_MAX - 1, &len, &status);
     if (hr != NexusHttp_Ok) {
-        LOG_E("update: manifest fetch failed -- %s", nexusHttpStr(hr));
-        snprintf(g_state.status, sizeof(g_state.status), "%s", nexusHttpStr(hr));
+        LOG_E("update: manifest fetch failed -- %s (status %ld)", nexusHttpStr(hr), status);
+
+        // 404 from the releases feed is the ordinary "no release has been cut
+        // yet" case, and deserves saying so rather than "server error".
+        if (status == 404) {
+            snprintf(g_state.status, sizeof(g_state.status), "no releases published yet");
+        } else {
+            snprintf(g_state.status, sizeof(g_state.status), "%s", nexusHttpStr(hr));
+        }
+
+        free(manifest);
         return MAKERESULT(Module_Libnx, LibnxError_IoError);
     }
     manifest[len] = '\0';
 
     JsonDoc *doc = (JsonDoc *)malloc(sizeof(JsonDoc));
-    if (doc == NULL) return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+    if (doc == NULL) {
+        free(manifest);
+        return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+    }
 
     if (jsonParse(doc, manifest, len) != NexusFmt_Ok) {
         free(doc);
+        free(manifest);
         snprintf(g_state.status, sizeof(g_state.status), "manifest is not valid JSON");
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
     }
@@ -171,7 +193,11 @@ Result nexusUpdateCheck(void)
         jsonGetString(doc, jsonObjectGet(doc, root, "notes"),
                       g_state.notes, sizeof(g_state.notes));
     }
+
+    // Freed only now: jsonParse borrows the text rather than copying it, so
+    // every jsonGetString above was reading straight out of this buffer.
     free(doc);
+    free(manifest);
 
     if (g_state.available[0] == '\0' || g_state.url[0] == '\0') {
         snprintf(g_state.status, sizeof(g_state.status), "manifest is missing version or url");

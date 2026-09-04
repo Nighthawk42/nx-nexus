@@ -21,7 +21,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 APP_TITLE   :=  NX-Nexus
 APP_AUTHOR  :=  NX-Nexus contributors
-APP_VERSION :=  0.1.0-dev
+APP_VERSION :=  0.1.0
 
 TARGET      :=  NX-Nexus
 BUILD       :=  build
