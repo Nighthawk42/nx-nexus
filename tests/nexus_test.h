@@ -62,3 +62,5 @@ void test_installer(void);
 void test_nsp_builder(void);
 void test_json(void);
 void test_sanitise(void);
+void test_xci(void);
+void test_ncz(void);

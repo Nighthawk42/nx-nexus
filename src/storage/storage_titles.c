@@ -25,6 +25,8 @@
 #include "nexus/mtp_types.h"
 #include "nexus/nsp_builder.h"
 #include "nexus/es.h"
+#include "nexus/ns_ext.h"
+#include "nexus/title_list.h"
 #include "nexus/sysinfo.h"
 #include "nexus/format.h"
 #include "nexus/log.h"
@@ -123,6 +125,34 @@ static u64 base_application_id(u64 id, u8 meta_type)
         case NcmContentMetaType_AddOnContent: return (id ^ 0x1000ull) & ~0xFFFull;
         default:                              return id;
     }
+}
+
+// Appends play statistics to info.txt. pdm is opened and closed per call: this
+// happens once when a title is opened for reading, not in a listing loop, and
+// holding another session open for the life of the process is not worth it.
+static void build_play_summary(u64 application_id, char *out, size_t out_size)
+{
+    out[0] = '\0';
+
+    if (R_FAILED(pdmqryInitialize())) return;
+
+    PdmPlayStatistics stats;
+    const Result rc = pdmqryQueryPlayStatisticsByApplicationId(application_id, false, &stats);
+
+    pdmqryExit();
+
+    if (R_FAILED(rc) || stats.total_launches == 0) return;
+
+    const u64 minutes = stats.playtime / (60ull * 1000000000ull);
+
+    // Seconds would be noise and days would lose detail on most titles, so
+    // hours and minutes it is.
+    snprintf(out, out_size,
+             "Play time  : %lluh %02llum\n"
+             "Launches   : %u\n",
+             (unsigned long long)(minutes / 60),
+             (unsigned long long)(minutes % 60),
+             stats.total_launches);
 }
 
 static const char *meta_type_name(u8 t)
@@ -423,6 +453,11 @@ static bool titles_open(TitlesStorage *s, u32 index)
         free(data);
     }
 
+    // Play statistics, when Horizon has any. A title that has never been
+    // launched simply has none, which is not an error.
+    char play[128] = "";
+    build_play_summary(base_application_id(e->key.id, e->key.type), play, sizeof(play));
+
     snprintf(s->info, sizeof(s->info),
              "Title ID   : %016llx\n"
              "Version    : %u\n"
@@ -431,14 +466,16 @@ static bool titles_open(TitlesStorage *s, u32 index)
              "Contents   : %d\n"
              "NSP size   : %llu bytes\n"
              "Ticket     : %s\n"
-             "Booted from: %s\n",
+             "Booted from: %s\n"
+             "%s",
              (unsigned long long)e->key.id, e->key.version,
              meta_type_name(e->key.type),
              e->storage_id == NcmStorageId_SdCard ? "SD card" : "internal",
              written,
              (unsigned long long)nspBuilderTotalSize(&s->nsp),
              s->tik_len > 0 ? "yes" : "none",
-             nexusSysInfoStorageName());
+             nexusSysInfoStorageName(),
+             play);
 
     s->open_index = (int)index;
     s->open_valid = true;
@@ -661,6 +698,52 @@ static Result titles_read(NexusStorage *self, const char *path, u64 offset,
     return 0;
 }
 
+static Result titles_thumbnail(NexusStorage *self, const char *path,
+                               void *buffer, size_t cap, size_t *out_len)
+{
+    TitlesStorage *s = (TitlesStorage *)self->impl;
+
+    if (out_len == NULL) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    *out_len = 0;
+
+    titles_list(s);
+
+    char head[TITLE_NAME_LEN], tail[TITLE_NAME_LEN];
+    if (!split(path, head, sizeof(head), tail, sizeof(tail))) {
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    }
+
+    // Only the title folder itself carries artwork.
+    if (tail[0] != '\0') return MAKERESULT(Module_Libnx, LibnxError_NotFound);
+
+    const int index = titles_find(s, head);
+    if (index < 0) return MAKERESULT(Module_Libnx, LibnxError_NotFound);
+
+    const TitleEntry *e = &s->entries[index];
+
+    NsApplicationControlData *data =
+        (NsApplicationControlData *)malloc(sizeof(NsApplicationControlData));
+    if (data == NULL) return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+
+    Result rc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
+    u64 actual = 0;
+
+    if (R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage,
+                                                base_application_id(e->key.id, e->key.type),
+                                                data, sizeof(*data), &actual))
+        && actual > sizeof(data->nacp)) {
+        size_t len = (size_t)(actual - sizeof(data->nacp));
+        if (len > cap) len = cap;
+
+        memcpy(buffer, data->icon, len);
+        *out_len = len;
+        rc = 0;
+    }
+
+    free(data);
+    return rc;
+}
+
 static Result titles_remove(NexusStorage *self, const char *path, bool is_dir)
 {
     TitlesStorage *s = (TitlesStorage *)self->impl;
@@ -682,26 +765,24 @@ static Result titles_remove(NexusStorage *self, const char *path, bool is_dir)
 
     TitleEntry *e = &s->entries[index];
 
-    // Deleting an Application removes its updates and DLC too, which is what
-    // ns does and what a user dragging a game to the trash expects.
-    //
-    // Updates and DLC are a different matter: removing just one means editing
-    // the application's record rather than deleting the application, and
-    // getting that wrong leaves the base game unlaunchable. Until that path is
-    // implemented and tested, refuse rather than risk it.
-    if (e->key.type != NcmContentMetaType_Application) {
-        LOG_W("titles: refusing to delete %s -- only base applications can be "
-              "deleted for now", e->name);
-        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-    }
-
     if (s->open_valid && s->open_index == index) titles_close_open(s);
 
     LOG_W("titles: deleting %s (%016llx)", e->name, (unsigned long long)e->key.id);
 
-    const Result rc = nsDeleteApplicationCompletely(e->key.id);
+    // Deleting an Application removes its updates and DLC too, which is what ns
+    // does and what a user dragging a game to the trash expects. An update or a
+    // single add-on is uninstalled on its own instead, leaving the base game
+    // installed and launchable.
+    // The delete itself lives in title_list.c so the on-console browser and
+    // the MTP path cannot drift apart on something this destructive.
+    const NexusTitleInfo info = {
+        .key        = e->key,
+        .storage_id = e->storage_id,
+    };
+    const Result rc = nexusTitleListDelete(&info);
+
     if (R_FAILED(rc)) {
-        LOG_E("titles: DeleteApplicationCompletely failed (0x%x)", rc);
+        LOG_E("titles: deleting %s failed (0x%x)", e->name, rc);
         return rc;
     }
 
@@ -724,6 +805,7 @@ static const NexusStorageOps g_titles_ops = {
     .remove      = titles_remove,
     .move        = NULL,
     .copy        = NULL,
+    .thumbnail   = titles_thumbnail,
 };
 
 Result nexusStorageTitlesCreate(NexusStorage *out, u32 storage_id, const char *description)

@@ -18,6 +18,13 @@
 
 #define NEXUS_SOURCES_PATH   "sdmc:/switch/nx-nexus/sources.json"
 
+// Where self-update looks by default. The GitHub releases API is understood
+// directly, so cutting a release is the whole publishing process -- there is no
+// separate manifest to keep in step with it. Users can point update_url at
+// their own JSON instead; both shapes are accepted.
+#define NEXUS_DEFAULT_UPDATE_URL \
+    "https://api.github.com/repos/Nighthawk42/nx-nexus/releases/latest"
+
 #define NEXUS_SOURCE_MAX          8
 #define NEXUS_SOURCE_NAME_LEN     48
 #define NEXUS_SOURCE_URL_LEN      512
@@ -44,7 +51,7 @@ typedef struct {
     u32         count;
 
     bool insecure;                       // user opted out of TLS verification
-    char update_url[NEXUS_SOURCE_URL_LEN];  // optional, for self-update
+    char update_url[NEXUS_SOURCE_URL_LEN];  // for self-update; defaults below
 } NexusSourcesConfig;
 
 /// Loads sources.json. A missing file is not an error: it writes a commented

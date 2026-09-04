@@ -17,24 +17,34 @@
 ---
 
 > **Status: early, and only partly proven on hardware.** USB enumeration and
-> SD-card browsing are confirmed working on a real console. The installer, game
-> card, save, title and NAND features build clean and are unit-tested where that
-> is possible, but have not all been exercised end to end. Treat it accordingly.
+> SD-card browsing are confirmed working on a real console. Everything else —
+> the installer, game card, saves, titles, NAND, NSZ decompression, firmware —
+> builds clean and is unit-tested wherever that is possible off-console, but has
+> not all been exercised end to end. Treat it accordingly.
 
 ## What it does
 
 - Appears as a standard **MTP device** — browse and transfer with your normal
-  file manager
+  file manager, with real box art as folder thumbnails
 - **Installs titles without staging.** Drop an NSP into an install store and the
   bytes go from the USB buffer straight into `ncm`; nothing is written to the SD
   card first
+- **Installs NSP, NSZ, XCI and XCZ**, from USB, from the SD card, from an
+  inserted game card, or from your own server
+- **Handles split NSPs** — the numbered-parts layout FAT32 forces, with or
+  without the archive bit
+- **Verifies installed content** against the SHA-256 in its own manifest, which
+  is how you tell a failing SD card from a bad download
 - **Extracts installed titles** back out as a synthesised NSP that exists only
   while you copy it
 - **Dumps game cards** as their filesystem, or as a byte-exact `card.xci`
 - **Backs up and restores saves**, with restores staged so a failed transfer
   cannot corrupt a live save
 - **Reads raw NAND partitions** of whichever MMC you booted from
-- **Installs from your own server** over HTTPS, and can update itself
+- **Browses, verifies and deletes installed titles** on the console itself,
+  including removing a single update or DLC without touching the base game
+- **Manages LayeredFS mods and cheat files**, enabling and disabling them
+  without moving a byte
 - **Installs system firmware — emuMMC only**, refused outright on sysMMC
 - **No keys, anywhere.** NCAs are never decrypted by this tool
 
@@ -49,6 +59,7 @@
 | `0x00010005` | **Saves** — one folder per save, named after the game | read/restore |
 | `0x00010006` | **Installed Titles** — browse, extract as NSP, delete | read/delete |
 | `0x00010007` | **NAND** — raw BIS partitions of the active MMC | read |
+| `0x00010008` | **Album** — screenshots and capture videos | read/write |
 
 ## Quick start
 
@@ -57,6 +68,9 @@ Copy `NX-Nexus.nro` to `sdmc:/switch/` and launch it from the homebrew menu.
 The USB interface is **not** brought up automatically — choose **Start MTP
 server** from the menu when you want the console to be visible. Press **+** to
 quit.
+
+To install without a PC at all, put `.nsp`, `.nsz`, `.xci` or `.xcz` files in
+`sdmc:/nsp` and use **Install from SD card or gamecard**.
 
 ## Build
 
@@ -79,6 +93,19 @@ natively.
 | [Architecture](docs/ARCHITECTURE.md) | Layout, design decisions, adding a store |
 | [Plan review](docs/PLAN-REVIEW.md) | Fact-check of the original design against reality |
 | [References](docs/REFERENCES.md) | Primary sources for every format and API used |
+
+## A note on NSZ
+
+NSZ and XCZ install directly; nothing is decompressed to the SD card first.
+
+This does not compromise the no-keys rule, and it is worth saying why. An NCZ
+carries the AES key and counter for each of its sections **in its own header** —
+the format's author put them there so third-party installers could rebuild the
+NCA without deriving anything. Creating an NSZ needs `prod.keys`; installing one
+does not. NX-Nexus still holds no key material and still never decrypts an NCA.
+
+The block-compressed NCZ variant is recognised and refused rather than
+half-decoded, because it is not a single zstd stream.
 
 ## On content sources
 

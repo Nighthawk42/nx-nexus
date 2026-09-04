@@ -12,8 +12,19 @@ src/
   mtp/               container wire format, transaction loop, operations
   storage/           one file per virtual store, plus the registry
   format/            container parsers -- no libnx, host-testable
-  installer/         install orchestration + its ncm/es/ns backend
-  horizon/           services libnx does not provide
+                       partition_fs, cnmt, ticket, nsp_builder, json,
+                       xci, ncz
+  installer/         install orchestration and the things that feed it
+                       installer.c      the orchestrator, host-testable
+                       install_horizon  ncm/es/ns backend
+                       local_install    SD card, split NSPs
+                       xci_install      XCI files and game cards
+                       ncz_decode       zstd + AES-CTR, for NSZ
+                       verify           content hashing
+                       firmware         emuMMC firmware install
+  horizon/           services libnx does not provide, plus system queries
+                       es, ns_ext, ncm_ext, fs_ext, sysinfo, compat,
+                       mods, title_list, maintenance
   net/               HTTP client, sources, network install, self-update
 tests/               host unit tests
 ```
@@ -33,7 +44,11 @@ kept as thin and boring as possible. `install_horizon.c` is a translation layer
 and nothing more; every decision it might have made lives in `installer.c`
 instead, where a mock backend can drive it.
 
-Current coverage: **813 assertions**, zero failures.
+Current coverage: **888 assertions**, zero failures.
+
+The XCI and NCZ parsers earned their tests immediately: the first XCI build had
+its overflow guards inverted, which would have made every gamecard install fail
+as "not an XCI", and the test caught it before the code ever reached hardware.
 
 ## Storage backends
 
@@ -81,9 +96,36 @@ emitting nothing. There is a regression test that truncates non-ASCII strings at
 every buffer size from 1 to 40.
 
 **Listing APIs that look paginated but are not.**
-`ncmContentMetaDatabaseList` has no offset parameter — it always returns from
+`ncmContentMetaDatabaseList` has no offset parameter -- it always returns from
 the beginning and reports the total separately. Calling it in a loop returns the
-same entries repeatedly.
+same entries repeatedly. `ncmContentMetaDatabaseListContentInfo` and
+`ListApplicationRecordContentMeta`, confusingly, *are* genuinely paginated and
+must be looped.
+
+**Application records are merged, not replaced.** Installing a patch reads the
+records already attached to the application and pushes the union. Replacing the
+record instead makes the base game vanish from HOME while its content stays
+registered, which looks exactly like data loss. A rollback restores the previous
+list rather than merely deleting what it pushed.
+
+**NSZ needs no keys.** An NCZ's header carries the AES key and counter for every
+section, so rebuilding the NCA is zstd plus AES-CTR with material that came out
+of the file itself. `format/ncz.c` parses the header and is host-tested;
+`installer/ncz_decode.c` does the zstd and the crypto and is not, because both
+libraries live on the console side.
+
+The decoder is attached to the installer through `NexusNczOps` for the same
+reason the backend is: the sequencing decision -- open the placeholder lazily,
+with the *decompressed* size, once the header has been read -- stays in
+`installer.c` where a mock can drive it.
+
+**Verification uses the manifest's own hashes.** The CNMT records a SHA-256 per
+NCA, over the NCA as stored and therefore still encrypted. No keys, and it
+catches the failure that actually happens: SD cards that rot silently.
+
+**Thumbnails come from `ns`, not from a GUI.** MTP has a `GetThumb` operation,
+so installed titles show real box art in the host's file browser without this
+project needing a graphical UI of its own.
 
 **The USB layer follows libnx's own `usb_comms.c`**, retargeted from the
 vendor-specific class to USB Still Image (PIMA 15740), which is what hosts probe

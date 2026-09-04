@@ -18,6 +18,7 @@
 #include "nexus/mtp_types.h"
 #include "nexus/installer.h"
 #include "nexus/install_horizon.h"
+#include "nexus/ncz_decode.h"
 #include "nexus/log.h"
 
 typedef struct {
@@ -27,20 +28,34 @@ typedef struct {
     // Live only for the duration of one transfer.
     NexusHorizonBackend *backend;
     NexusInstaller      *installer;
+    NexusNczDecoder     *decoder;
     bool                 active;
     char                 filename[NEXUS_PATH_MAX];
     u64                  declared_size;
 } InstallStorage;
 
 // True for names the installer can actually consume.
-static bool is_installable(const char *path)
+// Case-insensitive extension match: hosts preserve whatever case the file had.
+static bool has_ext(const char *path, const char *ext)
 {
     const size_t n = strlen(path);
-    if (n < 5) return false;
+    const size_t m = strlen(ext);
+    if (n <= m) return false;
 
-    // .nsp is a PFS0; .nsz is a compressed NSP that we cannot handle yet.
-    return strcmp(path + (n - 4), ".nsp") == 0
-        || strcmp(path + (n - 4), ".NSP") == 0;
+    for (size_t i = 0; i < m; i++) {
+        char c = path[n - m + i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (c != ext[i]) return false;
+    }
+    return true;
+}
+
+static bool is_installable(const char *path)
+{
+    // An NSZ is the same PFS0 container with compressed contents inside, so it
+    // goes through the identical path -- the decoder attached below handles the
+    // difference.
+    return has_ext(path, ".nsp") || has_ext(path, ".nsz");
 }
 
 static const char *inst_description(NexusStorage *self)
@@ -110,6 +125,10 @@ static void inst_teardown(InstallStorage *s)
         free(s->installer);
         s->installer = NULL;
     }
+    if (s->decoder != NULL) {
+        nexusNczDecoderDestroy(s->decoder);
+        s->decoder = NULL;
+    }
     if (s->backend != NULL) {
         nexusHorizonBackendDestroy(s->backend);
         s->backend = NULL;
@@ -130,7 +149,7 @@ static Result inst_write_begin(NexusStorage *self, const char *path, u64 declare
     }
 
     if (!is_installable(path)) {
-        LOG_W("install: refusing %s -- only .nsp is supported", path);
+        LOG_W("install: refusing %s -- drop a .nsp or .nsz here", path);
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
     }
 
@@ -147,6 +166,15 @@ static Result inst_write_begin(NexusStorage *self, const char *path, u64 declare
     }
 
     nexusInstallBegin(s->installer, nexusHorizonBackendOps(), s->backend, s->target);
+
+    // Attached for every transfer: the extension is a hint, not a promise, and
+    // the installer only discovers compression when it meets an .ncz entry.
+    s->decoder = nexusNczDecoderCreate();
+    if (s->decoder != NULL) {
+        nexusInstallSetDecompressor(s->installer, nexusNczDecoderOps(), s->decoder);
+    } else {
+        LOG_W("install: no memory for the decompressor -- NSZ will be refused");
+    }
 
     s->active        = true;
     s->declared_size = declared_size;

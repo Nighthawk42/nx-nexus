@@ -23,6 +23,8 @@ const char *nexusInstallStr(NexusInstallResult r)
         case NexusInstall_MissingContent:  return "missing content";
         case NexusInstall_BufferTooSmall:  return "buffer too small";
         case NexusInstall_BackendError:    return "backend error";
+        case NexusInstall_NoDecompressor:  return "compressed, and no decoder attached";
+        case NexusInstall_BadNcz:          return "bad or unsupported ncz";
         case NexusInstall_Aborted:         return "aborted";
         case NexusInstall_NotFinished:     return "stream not finished";
         default:                           return "unknown";
@@ -87,6 +89,22 @@ NexusEntryKind nexusInstallClassify(const char *name, u8 out_id[NEXUS_CONTENT_ID
         return NexusEntryKind_Nca;
     }
 
+    // NSZ: the same content, zstd-compressed. The content id still comes from
+    // the filename stem, so an .ncz installs as the .nca it rebuilds to.
+    if (ends_with(name, ".cnmt.ncz")) {
+        if (out_id != NULL && !nexusInstallParseContentId(name, stem_len, out_id)) {
+            return NexusEntryKind_Ignore;
+        }
+        return NexusEntryKind_MetaNcz;
+    }
+
+    if (ends_with(name, ".ncz")) {
+        if (out_id != NULL && !nexusInstallParseContentId(name, stem_len, out_id)) {
+            return NexusEntryKind_Ignore;
+        }
+        return NexusEntryKind_Ncz;
+    }
+
     if (ends_with(name, ".tik"))  return NexusEntryKind_Ticket;
     if (ends_with(name, ".cert")) return NexusEntryKind_Cert;
 
@@ -125,8 +143,11 @@ static NexusInstallResult build_entries(NexusInstaller *ins)
         slot->size       = e.size;
         memcpy(slot->content_id, id, sizeof(id));
 
-        if (kind == NexusEntryKind_MetaNca) {
+        if (NEXUS_KIND_IS_META(kind)) {
             memcpy(ins->meta_content_id, id, sizeof(id));
+            // For a compressed meta this is the compressed length; it is
+            // replaced with the real one once the decoder reports it, because
+            // the meta record must carry the size of the NCA on disk.
             ins->meta_nca_size = e.size;
             ins->has_meta_nca  = true;
         }
@@ -194,6 +215,40 @@ static size_t absorb_header(NexusInstaller *ins, const u8 *data, size_t len, siz
     return take;
 }
 
+// Receives reconstructed NCA bytes from the decompressor.
+//
+// The placeholder is opened here rather than at the start of the entry: an
+// NCZ's compressed length says nothing about the size of the NCA it rebuilds
+// to, and ncm needs the real length up front. The decoder does not emit
+// anything until it has read the section table, so by the first call the size
+// is known.
+static int ncz_sink(void *user, const void *data, size_t len)
+{
+    NexusInstaller *ins = (NexusInstaller *)user;
+
+    if (!ins->content_open) {
+        const u64 size = ins->ncz->size(ins->ncz_user);
+        if (size == 0) return -1;
+
+        const NexusInstallEntry *e = &ins->entries[ins->entry_cursor];
+        if (ins->ops->content_begin(ins->user, e->content_id, size) != 0) return -1;
+        ins->content_open = true;
+    }
+
+    if (ins->ops->content_write(ins->user, data, len) != 0) return -1;
+
+    ins->bytes_written += len;
+    return 0;
+}
+
+void nexusInstallSetDecompressor(NexusInstaller *ins, const NexusNczOps *ops, void *user)
+{
+    if (ins == NULL) return;
+
+    ins->ncz      = ops;
+    ins->ncz_user = user;
+}
+
 // Routes `len` bytes that fall inside the current entry.
 static NexusInstallResult route_bytes(NexusInstaller *ins, const u8 *data, size_t len)
 {
@@ -206,6 +261,15 @@ static NexusInstallResult route_bytes(NexusInstaller *ins, const u8 *data, size_
                 return fail(ins, NexusInstall_BackendError);
             }
             ins->bytes_written += len;
+            break;
+
+        case NexusEntryKind_Ncz:
+        case NexusEntryKind_MetaNcz:
+            // Straight into the decoder, which calls back into ncz_sink with
+            // reconstructed bytes once it knows how big the NCA will be.
+            if (ins->ncz->feed(ins->ncz_user, data, len) != 0) {
+                return fail(ins, NexusInstall_BadNcz);
+            }
             break;
 
         case NexusEntryKind_Ticket:
@@ -294,9 +358,18 @@ NexusInstallResult nexusInstallFeed(NexusInstaller *ins, const void *data, size_
                 break;
             }
 
-            // Opening a new content placeholder.
-            if (!ins->content_open
-                && (e->kind == NexusEntryKind_Nca || e->kind == NexusEntryKind_MetaNca)) {
+            // Opening a new content placeholder. A compressed entry defers
+            // this: its final size is not known until the decoder has read the
+            // NCZ header, so ncz_sink opens the placeholder instead.
+            if (NEXUS_KIND_IS_COMPRESSED(e->kind)) {
+                if (!ins->ncz_active) {
+                    if (ins->ncz == NULL) return fail(ins, NexusInstall_NoDecompressor);
+                    if (ins->ncz->begin(ins->ncz_user, ncz_sink, ins) != 0) {
+                        return fail(ins, NexusInstall_BadNcz);
+                    }
+                    ins->ncz_active = true;
+                }
+            } else if (!ins->content_open && NEXUS_KIND_IS_CONTENT(e->kind)) {
                 if (ins->ops->content_begin(ins->user, e->content_id, e->size) != 0) {
                     return fail(ins, NexusInstall_BackendError);
                 }
@@ -315,6 +388,19 @@ NexusInstallResult nexusInstallFeed(NexusInstaller *ins, const void *data, size_
 
             // Entry finished.
             if (ins->stream_pos >= entry_end) {
+                if (ins->ncz_active) {
+                    if (ins->ncz->end(ins->ncz_user) != 0) {
+                        return fail(ins, NexusInstall_BadNcz);
+                    }
+                    // The meta record wants the reconstructed size, not the
+                    // compressed one it was provisionally given.
+                    if (NEXUS_KIND_IS_META(e->kind)) {
+                        const u64 real = ins->ncz->size(ins->ncz_user);
+                        if (real > 0) ins->meta_nca_size = real;
+                    }
+                    ins->ncz_active = false;
+                }
+
                 if (ins->content_open) {
                     if (ins->ops->content_commit(ins->user) != 0) {
                         return fail(ins, NexusInstall_BackendError);
@@ -394,7 +480,7 @@ static NexusInstallResult build_meta(NexusInstaller *ins, const CnmtContext *cnm
         bool present = false;
         for (u32 j = 0; j < ins->entry_count; j++) {
             const NexusInstallEntry *e = &ins->entries[j];
-            if ((e->kind == NexusEntryKind_Nca || e->kind == NexusEntryKind_MetaNca)
+            if (NEXUS_KIND_IS_CONTENT(e->kind)
                 && memcmp(e->content_id, info.content_id, NEXUS_CONTENT_ID_SIZE) == 0) {
                 present = true;
                 break;

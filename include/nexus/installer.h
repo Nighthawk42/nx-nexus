@@ -56,6 +56,8 @@ typedef enum {
     NexusInstall_MissingContent,  // CNMT lists content the NSP did not carry
     NexusInstall_BufferTooSmall,
     NexusInstall_BackendError,
+    NexusInstall_NoDecompressor,  // an .ncz arrived with no decoder attached
+    NexusInstall_BadNcz,
     NexusInstall_Aborted,
     NexusInstall_NotFinished,     // finish called before the stream ended
 } NexusInstallResult;
@@ -157,7 +159,50 @@ typedef enum {
     NexusEntryKind_MetaNca,
     NexusEntryKind_Ticket,
     NexusEntryKind_Cert,
+
+    // The same two, compressed. An NSZ is an NSP whose NCAs have been replaced
+    // by NCZs; everything else about the container is identical.
+    NexusEntryKind_Ncz,
+    NexusEntryKind_MetaNcz,
 } NexusEntryKind;
+
+/// True for any kind that ends up as registered content.
+#define NEXUS_KIND_IS_CONTENT(k)                                       \
+    ((k) == NexusEntryKind_Nca  || (k) == NexusEntryKind_MetaNca ||    \
+     (k) == NexusEntryKind_Ncz  || (k) == NexusEntryKind_MetaNcz)
+
+#define NEXUS_KIND_IS_COMPRESSED(k)                                    \
+    ((k) == NexusEntryKind_Ncz  || (k) == NexusEntryKind_MetaNcz)
+
+#define NEXUS_KIND_IS_META(k)                                          \
+    ((k) == NexusEntryKind_MetaNca || (k) == NexusEntryKind_MetaNcz)
+
+// ---------------------------------------------------------------------------
+// Decompression hook
+//
+// Kept behind an interface for the same reason the backend is: zstd and AES
+// live on the console side, while the sequencing stays here where a host test
+// can drive it with a mock. The decoder never emits a byte before it knows the
+// reconstructed size, which is what lets the placeholder be opened lazily with
+// the *decompressed* length rather than the compressed one.
+// ---------------------------------------------------------------------------
+
+/// Receives reconstructed NCA bytes. Returns 0 on success.
+typedef int (*NexusNczSink)(void *user, const void *data, size_t len);
+
+typedef struct {
+    /// Starts one NCZ. Everything the decoder emits goes to sink.
+    int (*begin)(void *user, NexusNczSink sink, void *sink_user);
+
+    /// Feeds compressed bytes from the container.
+    int (*feed)(void *user, const void *data, size_t len);
+
+    /// Ends the entry. Non-zero means the NCZ did not decode cleanly.
+    int (*end)(void *user);
+
+    /// Size of the NCA being rebuilt, or 0 until the header has been read.
+    u64 (*size)(void *user);
+} NexusNczOps;
 
 typedef struct {
     u32 pfs_index;
@@ -196,6 +241,11 @@ typedef struct {
     bool has_meta_nca;
     u64  meta_nca_size;
 
+    // Decompression, when the container is an NSZ.
+    const NexusNczOps *ncz;
+    void              *ncz_user;
+    bool               ncz_active;
+
     u64 stream_pos;      // bytes consumed from the NSP so far
     u64 bytes_written;   // content bytes handed to the backend
 
@@ -206,6 +256,11 @@ typedef struct {
 NexusInstallResult nexusInstallBegin(NexusInstaller *ins,
                                      const NexusInstallBackendOps *ops, void *user,
                                      u8 target_storage);
+
+/// Attaches a decompressor, enabling .ncz entries. Without one, an NSZ fails
+/// with NexusInstall_NoDecompressor rather than installing something broken.
+/// Call after nexusInstallBegin.
+void nexusInstallSetDecompressor(NexusInstaller *ins, const NexusNczOps *ops, void *user);
 
 /// Feeds the next chunk of the NSP. Chunk boundaries are arbitrary -- the
 /// orchestrator reassembles headers and splits file data as needed.

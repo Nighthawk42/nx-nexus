@@ -53,10 +53,23 @@ jobs:
           test "$magic" = "NRO0"
           ls -l NX-Nexus.nro
 
+      # The App Store package is a fragment of the SD card plus a manifest
+      # saying where each file belongs. Built here so a release cannot ship an
+      # .nro without the matching package.
+      - name: Build the Homebrew App Store package
+        run: |
+          mkdir -p pkg/switch/NX-Nexus
+          cp NX-Nexus.nro pkg/switch/NX-Nexus/NX-Nexus.nro
+          cp packaging/manifest.install pkg/manifest.install
+          (cd pkg && zip -r ../NX-Nexus.zip .)
+          unzip -l NX-Nexus.zip
+
       - uses: actions/upload-artifact@v4
         with:
           name: NX-Nexus-nro
-          path: NX-Nexus.nro
+          path: |
+            NX-Nexus.nro
+            NX-Nexus.zip
           if-no-files-found: error
 
   release:
@@ -68,8 +81,12 @@ jobs:
         with:
           name: NX-Nexus-nro
 
+      # The .nro asset is what the in-app updater downloads: it looks for the
+      # first asset whose name ends in .nro, so the zip alongside it is safe.
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: NX-Nexus.nro
+          files: |
+            NX-Nexus.nro
+            NX-Nexus.zip
           generate_release_notes: true

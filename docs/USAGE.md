@@ -16,25 +16,45 @@ machine you plugged into for charging.
 | **A** | select or run |
 | **B** | back |
 | **L / R** | page (also scrolls the log) |
+| **X** | delete (on the title and mod lists; press twice) |
+| **Y** | change sort order (title list) |
+| **-** | change filter (title list) |
 | **+** | quit |
 
 ### Menu
 
+**Server**
+
 - **Start / Stop MTP server** — brings the USB interface up or down
 - **Stores** — what each store is and whether it is available
 - **Transfer status** — throughput, operation and error counts
+
+**Install**
+
+- **Install from SD card or gamecard** — no PC involved
 - **Install from a source** — browse a configured server and install
-- **Check for updates** — self-update, if `update_url` is configured
+
+**Manage**
+
+- **Installed titles** — browse, sort, filter, verify or delete
+- **Mods and cheats** — enable, disable or remove LayeredFS content
+- **Verify installed content** — hash everything against its manifest
 - **Maintenance** — reclaim space left by interrupted installs
+
+**System**
+
+- **Install firmware** — emuMMC only
+- **Check for updates** — self-update
 - **Log** — scrollable; also written to `sdmc:/switch/nx-nexus/nx-nexus.log`
 
 ## The stores
 
 ### Installing
 
-Copy an `.nsp` into **MicroSD Install** or **System Install**. The bytes stream
-from the USB buffer straight into `ncm` placeholders — nothing is staged on the
-SD card, so installing needs no free space beyond the title itself.
+Copy an `.nsp` or `.nsz` into **MicroSD Install** or **System Install**. The
+bytes stream from the USB buffer straight into `ncm` placeholders — nothing is
+staged on the SD card, so installing needs no free space beyond the title
+itself.
 
 The stores are intentionally empty when browsed: they are drop targets, not
 folders.
@@ -54,9 +74,13 @@ The `.nsp` does not exist anywhere — its header is generated on the fly and it
 body is read out of `ncm` as you copy it. Deleting a title folder deletes the
 title.
 
-> Deleting an **update or DLC** on its own is refused. Removing one means
-> rewriting the application's record rather than deleting the application, and
-> getting that wrong leaves the base game unlaunchable.
+Deleting an **update or DLC** on its own removes just that content and trims
+the application's record, leaving the base game installed and launchable.
+Deleting a base game removes its updates and DLC with it, which is what the
+system itself does.
+
+Folders show the game's real box art as a thumbnail in file managers that ask
+for one, which is most of them.
 
 ### Game card
 
@@ -97,7 +121,7 @@ first run:
 ```json
 {
   "insecure": false,
-  "update_url": "",
+  "update_url": "https://api.github.com/repos/Nighthawk42/nx-nexus/releases/latest",
   "sources": [
     { "name": "My server", "url": "https://your-server.example/index.json" }
   ]
@@ -129,7 +153,9 @@ you typed. Public "free shops" are not supported and not endorsed.
 
 ## Updating
 
-Set `update_url` in `sources.json` to a manifest:
+`update_url` defaults to this project's GitHub releases feed, and the release
+API's own JSON is understood directly — there is no separate manifest to keep in
+step with a release. Point it somewhere else and it will also accept:
 
 ```json
 { "version": "0.2.0", "url": "https://.../NX-Nexus.nro", "notes": "what changed" }
@@ -139,6 +165,12 @@ Set `update_url` in `sources.json` to a manifest:
 checked automatically. The download lands on a scratch name, is verified to
 actually be an NRO before replacing the running one, and the previous build is
 kept as `NX-Nexus.nro.bak`.
+
+The file replaced is the one you launched, taken from `argv[0]` — so an install
+under `switch/NX-Nexus/` from the Homebrew App Store updates itself in place
+rather than writing a second copy somewhere you are not running from.
+
+Being HTTPS, this needs the CA bundle described above.
 
 ## Installing firmware
 
@@ -185,6 +217,82 @@ describes content that is not there. Any failure rolls the whole thing back.
 > it has not been run against a real system partition. Do not use it on
 > anything you cannot restore.
 
+## Installing from the SD card or a game card
+
+**Install from SD card or gamecard** needs no PC at all.
+
+Put files in `sdmc:/nsp` (created on first scan):
+
+| | |
+|---|---|
+| `Game.nsp` | an ordinary NSP |
+| `Game.nsz` | a compressed NSP — installs directly, nothing is unpacked first |
+| `Game.xci` / `Game.xcz` | a game card image; the `secure` partition is installed |
+| `Game.nsp/` | a **split** NSP: a folder of numbered parts `00`, `01`, `02`… |
+
+The split form exists because FAT32 cannot hold a file over 4 GiB. NX-Nexus
+reads the parts itself, so it works whether or not the archive bit is set — the
+detail that most often makes a split NSP fail elsewhere.
+
+Nothing is copied or unpacked: bytes go from the file straight into `ncm`, the
+same as the USB path.
+
+### From the game card in the slot
+
+The first entry installs the inserted card directly. There is no dump step, so
+a 30 GB game needs 30 GB of free space rather than 60.
+
+### NSZ and XCZ
+
+Compressed images install everywhere an uncompressed one does — USB, SD card,
+game card and network alike.
+
+This does not need keys, and it is worth knowing why. An NCZ carries the AES key
+and counter for each of its sections **in its own header**, put there so
+third-party installers could rebuild the NCA without deriving anything. Making
+an NSZ needs `prod.keys`; installing one does not.
+
+The block-compressed NCZ variant is refused rather than half-decoded — it is not
+a single zstd stream, and feeding it to one would produce a corrupt NCA that
+only failed much later.
+
+## Verifying installed content
+
+**Verify installed content** reads every installed NCA back out of `ncm`,
+hashes it, and compares the result with the SHA-256 the title's own manifest
+records.
+
+That hash covers the NCA exactly as stored — encrypted — so no key material is
+involved. It is the cheapest way to answer the question that actually matters
+when a game will not launch: are the bytes damaged, or is something else wrong?
+
+Verifying everything takes a while; **B** stops it. **A** on a single title in
+the title list checks just that one.
+
+Anything reported as corrupt should be reinstalled. Corruption on an SD card
+usually means the card itself is failing, and one bad title is rarely the only
+one.
+
+Delta fragments are skipped: the manifest lists them, but they are never
+installed, so their absence is normal rather than a fault.
+
+## Mods and cheats
+
+**Mods and cheats** lists everything under `sdmc:/atmosphere/contents` that has
+an `exefs`, a `romfs` or a `cheats` folder.
+
+- **A** enables or disables an entry
+- **X**, twice, deletes it permanently
+
+Disabling renames the folder so Atmosphère stops looking at it — Atmosphère only
+reads directories whose names parse as a 16-character title id. Nothing is moved
+or rewritten, and enabling puts the name back. That renaming convention is this
+tool's, not an Atmosphère feature, but it is reliable and reversible.
+
+Individual cheats within a file cannot be toggled here: that needs `dmnt:cht`,
+which only works against a running game, and the running application is
+NX-Nexus.
+
 ## Maintenance
 
 Interrupted installs leave placeholder files that were never registered. They
@@ -213,6 +321,15 @@ USB homebrew first.
 is an exact multiple of `wMaxPacketSize` must be followed by a ZLP.
 `src/mtp/mtp_server.c` derives the packet size from the negotiated bus speed and
 sends it.
+
+**An NSZ fails with "bad or unsupported ncz".** Almost always the
+block-compressed variant, which is refused deliberately. The log names the
+reason. Recompress without block mode, or use the plain NSP.
+
+**A title installs but will not launch.** Two likely causes, both of which the
+log reports at install time: the title needs newer firmware than the console
+runs, or signature patches are not installed. Neither stops the install, because
+neither makes the content invalid.
 
 **Saves, Titles or NAND are empty.** Almost always FS permissions — a plain
 hbmenu launch may not be allowed to enumerate savedata or open BIS. The log

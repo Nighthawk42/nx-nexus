@@ -88,6 +88,15 @@ Result nexusStorageRegistryInit(void)
         LOG_W("storage: NAND store unavailable (0x%x)", rc);
     }
 
+    // --- Store 8: album ---
+    rc = nexusStorageAlbumCreate(&g_storages[g_count], NEXUS_STORAGE_ALBUM,
+                                 "8: Album");
+    if (R_SUCCEEDED(rc)) {
+        g_count++;
+    } else {
+        LOG_W("storage: album store unavailable (0x%x)", rc);
+    }
+
     g_initialized = true;
     LOG_I("storage: %zu store(s) registered", g_count);
     return 0;
@@ -111,6 +120,10 @@ void nexusStorageRegistryExit(void)
     memset(g_storages, 0, sizeof(g_storages));
     g_count       = 0;
     g_initialized = false;
+
+    // The album holds a devoptab mount of its own, which outlives the store
+    // struct and has to be released separately.
+    nexusStorageAlbumDestroy();
 }
 
 void nexusStorageRegistryRefresh(void)

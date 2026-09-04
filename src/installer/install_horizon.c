@@ -13,11 +13,15 @@
 #include "nexus/install_horizon.h"
 #include "nexus/es.h"
 #include "nexus/ns_ext.h"
+#include "nexus/ncm_ext.h"
+#include "nexus/compat.h"
 #include "nexus/log.h"
 
 // Registered content is remembered so a late failure can delete it again
 // rather than leaving orphaned NCAs consuming storage forever.
 #define MAX_REGISTERED NEXUS_INSTALL_MAX_CONTENTS
+
+#define MAX_APP_RECORDS NEXUS_NS_MAX_APP_RECORDS
 
 struct NexusHorizonBackend {
     NcmContentStorage      cs;
@@ -36,6 +40,14 @@ struct NexusHorizonBackend {
 
     bool meta_committed;
     bool record_pushed;
+
+    // The application record as it was before this install touched it. Pushing
+    // a record means deleting the existing one first, so a rollback has to put
+    // the original list back or the install failure takes the user's other
+    // titles down with it.
+    NexusContentStorageRecord saved_records[MAX_APP_RECORDS];
+    s32                       saved_record_count;
+    bool                      saved_records_valid;
 };
 
 // Maps a title id to the application it belongs to. Patches and add-on content
@@ -143,62 +155,8 @@ static int hz_read_cnmt(void *user, const u8 meta_id[NEXUS_CONTENT_ID_SIZE],
     NcmContentId cid;
     memcpy(cid.c, meta_id, NEXUS_CONTENT_ID_SIZE);
 
-    // The Meta NCA is registered by this point, so ncm can give us its path.
-    char path[FS_MAX_PATH] = {0};
-    Result rc = ncmContentStorageGetPath(&b->cs, path, sizeof(path), &cid);
-    if (R_FAILED(rc)) {
-        LOG_E("install: GetPath for meta nca failed (0x%x)", rc);
-        return -1;
-    }
-
-    // Mounting as ContentMeta is what makes this work without keys: Horizon
-    // decrypts the NCA and exposes the plaintext .cnmt inside.
-    FsFileSystem fs;
-    rc = fsOpenFileSystemWithId(&fs, 0, FsFileSystemType_ContentMeta, path,
-                                FsContentAttributes_All);
-    if (R_FAILED(rc)) {
-        LOG_E("install: mounting meta nca failed (0x%x)", rc);
-        return -1;
-    }
-
-    int result = -1;
-    FsDir dir;
-    if (R_SUCCEEDED(fsFsOpenDirectory(&fs, "/", FsDirOpenMode_ReadFiles, &dir))) {
-        FsDirectoryEntry entry;
-        s64 read_count = 0;
-
-        while (R_SUCCEEDED(fsDirRead(&dir, &read_count, 1, &entry)) && read_count > 0) {
-            const size_t n = strlen(entry.name);
-            if (n < 5 || strcmp(entry.name + (n - 5), ".cnmt") != 0) continue;
-
-            char file_path[FS_MAX_PATH];
-            snprintf(file_path, sizeof(file_path), "/%s", entry.name);
-
-            FsFile file;
-            if (R_FAILED(fsFsOpenFile(&fs, file_path, FsOpenMode_Read, &file))) break;
-
-            s64 size = 0;
-            if (R_SUCCEEDED(fsFileGetSize(&file, &size))
-                && size > 0 && (size_t)size <= cap) {
-                u64 got = 0;
-                if (R_SUCCEEDED(fsFileRead(&file, 0, out, (u64)size, FsReadOption_None, &got))) {
-                    *out_len = (size_t)got;
-                    result = 0;
-                }
-            } else {
-                LOG_E("install: cnmt is %lld bytes, buffer is %zu", (long long)size, cap);
-            }
-
-            fsFileClose(&file);
-            break;
-        }
-        fsDirClose(&dir);
-    }
-
-    fsFsClose(&fs);
-
-    if (result != 0) LOG_E("install: could not read the .cnmt from the meta nca");
-    return result;
+    // The Meta NCA is registered by this point, so ncm can mount it for us.
+    return R_SUCCEEDED(nexusNcmReadCnmt(&b->cs, &cid, out, cap, out_len)) ? 0 : -1;
 }
 
 static int hz_import_ticket(void *user, const void *tik, size_t tik_len,
@@ -278,6 +236,33 @@ static int hz_register_meta(void *user, const NexusInstallMeta *meta)
     return 0;
 }
 
+// Applications and patches both carry RequiredSystemVersion as a u32 at offset
+// 0x8 of their extended header. Checking it turns "the game installed fine but
+// crashes on launch" into something the user is told about up front.
+//
+// This warns rather than refuses: the install itself is perfectly valid, and
+// the user may be about to update their firmware.
+static void warn_if_firmware_too_old(const NexusInstallMeta *meta)
+{
+    const bool has_required = (meta->meta_type == CnmtMetaType_Application
+                               || meta->meta_type == CnmtMetaType_Patch)
+                              && meta->ext_header_size >= 0x0C;
+    if (!has_required) return;
+
+    u32 required = 0;
+    memcpy(&required, meta->ext_header + 0x8, sizeof(required));
+
+    if (!nexusCompatTitleTooNew(required)) return;
+
+    char needed[16], have[16];
+    nexusCompatFormatVersion(required, needed, sizeof(needed));
+    nexusCompatFormatVersion(nexusCompatFirmwareValue(), have, sizeof(have));
+
+    LOG_W("install: %016llx needs firmware %s but this console runs %s -- "
+          "it will install but may not launch",
+          (unsigned long long)meta->title_id, needed, have);
+}
+
 static int hz_push_record(void *user, const NexusInstallMeta *meta)
 {
     NexusHorizonBackend *b = (NexusHorizonBackend *)user;
@@ -294,21 +279,66 @@ static int hz_push_record(void *user, const NexusInstallMeta *meta)
         .storage_id = (u8)b->storage_id,
     };
 
-    // PushApplicationRecord will not overwrite, so an existing record has to be
-    // removed first. A missing record is the normal case for a fresh install,
-    // so the failure is expected and ignored.
-    //
-    // Known limitation: this replaces the record rather than merging with
-    // records already attached to the application. Installing a patch for a
-    // title that is already present should really read the existing records
-    // via nexusNsListApplicationRecordContentMeta and push the union.
-    nexusNsDeleteApplicationRecord(app_id);
+    // Read what is already attached to this application, so installing an
+    // update or a DLC adds to the title instead of replacing it. Getting this
+    // wrong makes the base game disappear from HOME even though its content is
+    // still registered, which looks exactly like data loss to the user.
+    b->saved_record_count  = nexusNsReadApplicationRecords(app_id, b->saved_records,
+                                                           MAX_APP_RECORDS);
+    b->saved_records_valid = true;
 
-    Result rc = nexusNsPushApplicationRecord(app_id, 3, &record, 1);
-    if (R_FAILED(rc)) {
-        LOG_E("install: PushApplicationRecord failed (0x%x)", rc);
+    // Build the union: everything that is not the same content meta we are
+    // installing now, plus the new record. Matching on id and type replaces an
+    // older version of the same meta rather than accumulating both.
+    //
+    // Heap rather than stack: this runs on the MTP responder thread, and the
+    // full record array is several kilobytes.
+    NexusContentStorageRecord *merged = (NexusContentStorageRecord *)
+        malloc(sizeof(NexusContentStorageRecord) * MAX_APP_RECORDS);
+    if (merged == NULL) {
+        LOG_E("install: out of memory building the application record");
         return -1;
     }
+
+    s32 merged_count = 0;
+
+    for (s32 i = 0; i < b->saved_record_count; i++) {
+        const NcmContentMetaKey *k = &b->saved_records[i].key;
+        if (k->id == meta->title_id && k->type == meta->meta_type) continue;
+
+        if (merged_count >= MAX_APP_RECORDS - 1) {
+            LOG_E("install: application %016llX has more than %d records",
+                  (unsigned long long)app_id, MAX_APP_RECORDS);
+            free(merged);
+            return -1;
+        }
+        merged[merged_count++] = b->saved_records[i];
+    }
+    merged[merged_count++] = record;
+
+    // PushApplicationRecord will not overwrite, so the existing record has to
+    // be removed first. Failure is expected when there was nothing there.
+    nexusNsDeleteApplicationRecord(app_id);
+
+    const Result rc = nexusNsPushApplicationRecord(app_id, 3, merged, (size_t)merged_count);
+    free(merged);
+
+    if (R_FAILED(rc)) {
+        LOG_E("install: PushApplicationRecord failed (0x%x)", rc);
+
+        // The old record is already gone at this point. Put it back rather
+        // than leaving the application with no record at all.
+        if (b->saved_record_count > 0) {
+            nexusNsPushApplicationRecord(app_id, 3, b->saved_records,
+                                         (size_t)b->saved_record_count);
+        }
+        return -1;
+    }
+
+    LOG_I("install: application record %016llX now has %d entr%s",
+          (unsigned long long)app_id, merged_count, merged_count == 1 ? "y" : "ies");
+
+    warn_if_firmware_too_old(meta);
 
     b->record_pushed = true;
     return 0;
@@ -325,9 +355,27 @@ static void hz_rollback(void *user, const NexusInstallMeta *meta)
         b->placeholder_open = false;
     }
 
-    // Undo in reverse order of creation.
+    // Undo in reverse order of creation. Restoring the application record
+    // means putting back exactly the list that was there before, not merely
+    // deleting ours -- the merged push replaced records belonging to titles
+    // this install never touched.
     if (b->record_pushed && meta != NULL) {
-        nexusNsDeleteApplicationRecord(base_application_id(meta->title_id, meta->meta_type));
+        const u64 app_id = base_application_id(meta->title_id, meta->meta_type);
+
+        nexusNsDeleteApplicationRecord(app_id);
+
+        if (b->saved_records_valid && b->saved_record_count > 0) {
+            const Result rc = nexusNsPushApplicationRecord(
+                app_id, 3, b->saved_records, (size_t)b->saved_record_count);
+            if (R_FAILED(rc)) {
+                LOG_E("install: could not restore the previous application "
+                      "record for %016llX (0x%x) -- reinstall the title to "
+                      "make it visible again", (unsigned long long)app_id, rc);
+            } else {
+                LOG_I("install: restored %d record(s) for %016llX",
+                      b->saved_record_count, (unsigned long long)app_id);
+            }
+        }
         b->record_pushed = false;
     }
 

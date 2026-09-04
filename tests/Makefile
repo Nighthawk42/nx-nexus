@@ -27,9 +27,10 @@ OBJDIR := obj
 TARGET := nexus-tests
 
 TEST_SRCS := test_main.c fixtures.c test_partition_fs.c test_cnmt.c \
-             test_ticket.c test_installer.c test_nsp_builder.c test_json.c test_sanitise.c
+             test_ticket.c test_installer.c test_nsp_builder.c test_json.c \
+             test_sanitise.c test_xci.c test_ncz.c
 
-FMT_SRCS  := format.c partition_fs.c cnmt.c ticket.c nsp_builder.c json.c
+FMT_SRCS  := format.c partition_fs.c cnmt.c ticket.c nsp_builder.c json.c xci.c ncz.c
 INST_SRCS := installer.c
 
 OBJS := $(addprefix $(OBJDIR)/,$(TEST_SRCS:.c=.o)) \

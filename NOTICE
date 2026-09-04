@@ -102,6 +102,38 @@ src/horizon/sysinfo.c
   source/core/nxdt_utils.c (GPL-3.0-or-later). The surrounding code is
   original.
 
+src/horizon/compat.c
+  Item 65000, ExosphereApiVersion, from the same Exosphere ABI and identified
+  the same way. The surrounding code is original.
+
+src/format/ncz.c, src/installer/ncz_decode.c
+  The NCZ container layout — the "NCZSECTN" preamble at 0x4000, the 0x38-byte
+  section entry, the AES-CTR counter construction, and the fact that the first
+  0x4000 bytes are the original NCA header copied through — was taken from the
+  format documentation and the reference decompressor published by nicoboss:
+
+    https://github.com/nicoboss/nsz
+    nsz/IndependentNczDecompressorConcise.py, docs/formats.md
+
+  This is a clean-room implementation in C from that description. No code was
+  copied; the reference is Python and was consulted for the layout only. It was
+  consulted in preference to docs/formats.md alone because the prose there
+  folds the one-off section magic into the section entry, which reads as though
+  entries were 0x48 bytes rather than 0x38.
+
+  Worth recording for anyone auditing the no-keys claim: an NCZ carries the AES
+  key and counter for each section in its own header, deliberately, so that
+  third-party installers can rebuild the NCA without deriving key material.
+  Creating an NSZ requires prod.keys; installing one does not, and NX-Nexus
+  holds no key material of its own.
+
+src/installer/firmware.c
+  Clean-room from the switchbrew wiki. Atmosphere's Daybreak was NOT used as a
+  source: Atmosphere is GPL-2.0-**only** ("version 2, as published by the Free
+  Software Foundation", with no "or later" clause), which is incompatible with
+  this project's GPL-3.0-or-later. This is the one project in the ecosystem
+  that the GPLv3 choice makes unavailable.
+
 Everything else in this repository is original work by the NX-Nexus
 contributors. Nothing has been copied from Goldleaf, libusbhsfs or
 mtp-server-nx. Goldleaf's NSP installer was read to confirm that the Meta NCA's

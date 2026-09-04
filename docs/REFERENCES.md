@@ -66,19 +66,59 @@ all of these except Tinwoo are available to port from — see
 - `Huntereb/Tinwoo` — **does not exist**; surviving forks declare no licence, so
   they grant no rights and must not be used under any circumstances
 
-## Still to be sourced (Phase 2 / 3)
+  Atmosphere is deliberately absent from that list: it is GPL-2.0-**only**, so
+  its Daybreak firmware installer cannot be ported from into a GPL-3.0-or-later
+  work. `src/installer/firmware.c` is clean-room from the wiki instead.
 
-Now that the project is GPL-3.0-or-later, these may come from either the
-switchbrew wiki or the GPL reference implementations above. The wiki is still
-preferable where it documents the IPC directly, because it avoids inheriting
-another project's structure and version assumptions.
+## Compression
 
-| Needed | Wiki | GPL reference |
-|---|---|---|
-| `es` IPC (`ImportTicket`, `ImportTicketCertificateSet`) | yes | Goldleaf, nxdumptool |
-| PFS0 / NCA container layouts | yes | nxdumptool (most thorough) |
-| `ncm` content meta record format for `ncmContentMetaDatabaseSet` | partial | Goldleaf |
-| `nsPushApplicationRecord` record layout | partial | Goldleaf |
-| Raw gamecard storage IPC (absent from libnx) | partial | nxdumptool |
+- `nicoboss/nsz` — <https://github.com/nicoboss/nsz>
+  `docs/formats.md` and `nsz/IndependentNczDecompressorConcise.py` describe the
+  NCZ container: the `NCZSECTN` preamble at 0x4000, the 0x38-byte section
+  entry, the per-section AES key and counter, and the AES-CTR counter
+  construction (`Counter.new(64, prefix=nonce[0:8], initial_value=offset >> 4)`).
+
+  The reference implementation is the authority where the two disagree — the
+  prose folds the one-off magic into the section entry, which reads as though
+  entries were 0x48 bytes.
+
+  Note for anyone auditing the "no keys" claim: the section keys are *in the
+  file*, put there so third-party installers can rebuild an NCA without
+  deriving anything. Making an NSZ needs `prod.keys`; installing one does not.
+
+- Zstandard — <https://facebook.github.io/zstd/>
+  Linked from devkitPro portlibs (`libzstd.a`). Only the streaming
+  decompression API is used.
+
+## Runtime key derivation, and its limits
+
+nxdumptool's README is the practical reference here. It can derive the NCA
+header key and decrypt NCA key areas at runtime through the SPL services, so
+gamecard operations need no keys file — but NSP dumping and RomFS/ExeFS access
+for SD/eMMC titles still require `sdmc:/switch/prod.keys`, specifically
+`eticket_rsa_kek` and `titlekek_XX`.
+
+NX-Nexus needs none of that, because it never decrypts an NCA: content ids come
+from filenames, sizes and hashes from the CNMT (which Horizon decrypts for us),
+and NCZ section keys from the NCZ itself.
+
+<https://github.com/DarkMatterCore/nxdumptool/blob/main/README.md>
+
+## Sourced during implementation
+
+Everything the first two phases needed has now been written, from the wiki
+except where [../NOTICE](../NOTICE) records otherwise.
+
+| Needed | Where it came from |
+|---|---|
+| `es` IPC (`ImportTicket`, `ImportTicketCertificateSet`) | switchbrew wiki |
+| PFS0 / HFS0 container layouts | switchbrew wiki |
+| XCI gamecard header layout | switchbrew wiki |
+| `ncm` content meta record format | switchbrew wiki |
+| `nsPushApplicationRecord` / `ListApplicationRecordContentMeta` | switchbrew wiki |
+| Raw gamecard storage IPC (absent from libnx) | nxdumptool — see NOTICE |
+| Exosphere SPL config items 65000 / 65007 | nxdumptool — see NOTICE |
+| NCZ container layout | nsz — see NOTICE |
+| `ContentMetaInfo` layout, for firmware installs | switchbrew wiki |
 
 <https://switchbrew.org/wiki/Main_Page>

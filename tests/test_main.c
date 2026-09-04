@@ -64,5 +64,11 @@ int main(void)
     printf("\nsanitise:\n");
     test_sanitise();
 
+    printf("\nxci:\n");
+    test_xci();
+
+    printf("\nncz:\n");
+    test_ncz();
+
     return nexusTestReport();
 }

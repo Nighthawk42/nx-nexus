@@ -33,7 +33,7 @@ static const char *k_template =
 "  ],\n"
 "\n"
 "  \"insecure\": false,\n"
-"  \"update_url\": \"\",\n"
+"  \"update_url\": \"" NEXUS_DEFAULT_UPDATE_URL "\",\n"
 "\n"
 "  \"sources\": [\n"
 "    { \"name\": \"Example (edit me)\", \"url\": \"https://your-server.example/index.json\" }\n"
@@ -211,6 +211,13 @@ Result nexusSourcesLoad(NexusSourcesConfig *cfg)
     }
     jsonGetString(doc, jsonObjectGet(doc, root, "update_url"),
                   g_cfg.update_url, sizeof(g_cfg.update_url));
+
+    // An older sources.json predates the default, and an empty string here
+    // would otherwise disable updates silently.
+    if (g_cfg.update_url[0] == '\0') {
+        snprintf(g_cfg.update_url, sizeof(g_cfg.update_url), "%s",
+                 NEXUS_DEFAULT_UPDATE_URL);
+    }
 
     const u32 arr = jsonObjectGet(doc, root, "sources");
     const u32 n   = jsonCount(doc, arr);

@@ -19,6 +19,7 @@
 #define NEXUS_STORAGE_SAVES         0x00010005u  // virtual save backup/restore
 #define NEXUS_STORAGE_TITLES        0x00010006u  // installed titles: browse, extract, delete
 #define NEXUS_STORAGE_BIS           0x00010007u  // raw NAND partitions of the active MMC
+#define NEXUS_STORAGE_ALBUM         0x00010008u  // screenshots and capture videos
 
 #define NEXUS_MAX_STORAGES 12
 
@@ -84,7 +85,18 @@ typedef struct {
     /// case the MTP layer reports the operation as unsupported rather than
     /// emulating it with a round trip through the host.
     Result (*copy)(NexusStorage *self, const char *from, const char *to);
+
+    /// Fills buffer with a JPEG thumbnail for path, if the store has one.
+    /// This is how installed titles get real box art in the host's file
+    /// browser without NX-Nexus needing a graphical UI of its own.
+    /// NULL, or a failure return, means "no thumbnail" and is not an error.
+    Result (*thumbnail)(NexusStorage *self, const char *path,
+                        void *buffer, size_t cap, size_t *out_len);
 } NexusStorageOps;
+
+/// Switch title icons are always 256x256 JPEG.
+#define NEXUS_THUMB_DIM       256
+#define NEXUS_THUMB_MAX_BYTES (256u * 1024u)
 
 struct NexusStorage {
     u32 storage_id;
@@ -129,6 +141,14 @@ bool nexusStorageIsPresent(u32 storage_id);
 /// Passthrough backend over a libnx devoptab mount (e.g. "sdmc:").
 Result nexusStorageSdmcCreate(NexusStorage *out, u32 storage_id,
                               const char *mount, const char *description);
+
+/// Screenshots and capture videos. Mounts the album image directory under its
+/// own devoptab name and then reuses the passthrough backend, which is why
+/// deleting and copying come for free.
+Result nexusStorageAlbumCreate(NexusStorage *out, u32 storage_id,
+                               const char *description);
+
+void nexusStorageAlbumDestroy(void);
 
 /// Write-only drop target that streams dropped NSPs through the installer.
 /// target is a NexusInstallTarget (NcmStorageId) value.

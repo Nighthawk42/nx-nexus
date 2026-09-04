@@ -31,6 +31,7 @@ static const u16 g_supported_ops[] = {
     MtpOp_GetObjectHandles,
     MtpOp_GetObjectInfo,
     MtpOp_GetObject,
+    MtpOp_GetThumb,
     MtpOp_GetPartialObject,
     MtpOp_DeleteObject,
     MtpOp_SendObjectInfo,
@@ -417,6 +418,14 @@ static const char *path_basename(const char *path)
     return (slash != NULL && slash[1] != '\0') ? slash + 1 : path;
 }
 
+// Cheap probe: does this object have artwork at all? Generating the thumbnail
+// to find out would make every directory listing expensive, so stores answer
+// by declaring the hook and the actual fetch happens only on GetThumb.
+static bool object_has_thumbnail(NexusStorage *s, const NexusObject *obj)
+{
+    return s->ops->thumbnail != NULL && obj->is_dir;
+}
+
 static Result op_get_object_info(const MtpContainer *cmd)
 {
     if (cmd->param_count < 1) {
@@ -445,10 +454,15 @@ static Result op_get_object_info(const MtpContainer *cmd)
     // ObjectCompressedSize is 32-bit in this legacy dataset; hosts read the
     // real size from the ObjectSize property for files above 4 GiB.
     mtpWriteU32(&w, (size > 0xFFFFFFFFll) ? 0xFFFFFFFFu : (u32)size);
-    mtpWriteU16(&w, 0);          // ThumbFormat
-    mtpWriteU32(&w, 0);          // ThumbCompressedSize
-    mtpWriteU32(&w, 0);          // ThumbPixWidth
-    mtpWriteU32(&w, 0);          // ThumbPixHeight
+    // Advertising a thumbnail here is what makes a host bother to ask for one
+    // with GetThumb. The size is not known without generating it, and hosts
+    // treat this field as advisory, so a nominal value is enough.
+    const bool has_thumb = object_has_thumbnail(s, &obj);
+
+    mtpWriteU16(&w, has_thumb ? MtpFormat_EXIF_JPEG : 0);          // ThumbFormat
+    mtpWriteU32(&w, has_thumb ? NEXUS_THUMB_MAX_BYTES : 0);        // ThumbCompressedSize
+    mtpWriteU32(&w, has_thumb ? NEXUS_THUMB_DIM : 0);              // ThumbPixWidth
+    mtpWriteU32(&w, has_thumb ? NEXUS_THUMB_DIM : 0);              // ThumbPixHeight
     mtpWriteU32(&w, 0);          // ImagePixWidth
     mtpWriteU32(&w, 0);          // ImagePixHeight
     mtpWriteU32(&w, 0);          // ImageBitDepth
@@ -466,6 +480,39 @@ static Result op_get_object_info(const MtpContainer *cmd)
     }
 
     Result rc = mtpSendDataFromPayload(cmd->code, cmd->transaction_id, mtpWriterLength(&w));
+    if (R_FAILED(rc)) return rc;
+    return mtpSendResponse(MtpRes_OK, cmd->transaction_id, NULL, 0);
+}
+
+// Sends a title's icon as the object's thumbnail. Hosts call this while
+// drawing a folder listing, so it has to be cheap and must never block for
+// long -- the icon comes out of ns, which caches it.
+static Result op_get_thumb(const MtpContainer *cmd)
+{
+    if (cmd->param_count < 1) {
+        return mtpSendResponse(MtpRes_InvalidParameter, cmd->transaction_id, NULL, 0);
+    }
+
+    NexusStorage *s = NULL;
+    NexusObject obj;
+    const u16 res = resolve_handle(cmd->params[0], &s, &obj);
+    if (res != MtpRes_OK) return mtpSendResponse(res, cmd->transaction_id, NULL, 0);
+
+    if (s->ops->thumbnail == NULL) {
+        return mtpSendResponse(MtpRes_NoThumbnailPresent, cmd->transaction_id, NULL, 0);
+    }
+
+    u8 *const buf = g_mtp_payload + MTP_CONTAINER_HEADER_SIZE;
+    const size_t cap = (MTP_PAYLOAD_BUF_SIZE - MTP_CONTAINER_HEADER_SIZE < NEXUS_THUMB_MAX_BYTES)
+        ? MTP_PAYLOAD_BUF_SIZE - MTP_CONTAINER_HEADER_SIZE
+        : NEXUS_THUMB_MAX_BYTES;
+
+    size_t len = 0;
+    if (R_FAILED(s->ops->thumbnail(s, obj.path, buf, cap, &len)) || len == 0) {
+        return mtpSendResponse(MtpRes_NoThumbnailPresent, cmd->transaction_id, NULL, 0);
+    }
+
+    const Result rc = mtpSendDataFromPayload(cmd->code, cmd->transaction_id, len);
     if (R_FAILED(rc)) return rc;
     return mtpSendResponse(MtpRes_OK, cmd->transaction_id, NULL, 0);
 }
@@ -1330,6 +1377,7 @@ Result mtpHandleCommand(const MtpContainer *cmd)
         case MtpOp_GetObjectHandles:        return op_get_object_handles(cmd);
         case MtpOp_GetObjectInfo:           return op_get_object_info(cmd);
         case MtpOp_GetObject:               return op_get_object(cmd);
+        case MtpOp_GetThumb:                return op_get_thumb(cmd);
         case MtpOp_GetPartialObject:        return op_get_partial_object(cmd);
         case MtpOp_DeleteObject:            return op_delete_object(cmd);
         case MtpOp_SendObjectInfo:          return op_send_object_info(cmd);

@@ -25,7 +25,31 @@
 
 static NexusUpdateState g_state;
 
+// Resolved from argv[0] at startup; falls back to the conventional location.
+static char g_self_path[FS_MAX_PATH] = NEXUS_UPDATE_PATH;
+
 const char *nexusUpdateVersion(void) { return NEXUS_VERSION; }
+
+void nexusUpdateSetSelfPath(const char *argv0)
+{
+    if (argv0 == NULL) return;
+
+    const size_t n = strlen(argv0);
+    if (n < 5 || n >= sizeof(g_self_path)) return;
+    if (strcmp(argv0 + (n - 4), ".nro") != 0) return;
+
+    // hbmenu passes an sdmc: path. Anything else -- a romfs path, say -- is not
+    // somewhere we can write, so leave the default alone.
+    if (strncmp(argv0, "sdmc:/", 6) != 0) {
+        LOG_W("update: launched from %.60s, which is not writable", argv0);
+        return;
+    }
+
+    snprintf(g_self_path, sizeof(g_self_path), "%s", argv0);
+    LOG_I("update: running from %s", g_self_path);
+}
+
+const char *nexusUpdateSelfPath(void) { return g_self_path; }
 
 const NexusUpdateState *nexusUpdateGetState(void) { return &g_state; }
 
@@ -45,6 +69,53 @@ static int version_cmp(const char *a, const char *b)
         if (*b == '.') b++; else if (*b != '\0') break;
     }
     return 0;
+}
+
+// Reads a GitHub "releases/latest" document:
+//
+//   { "tag_name": "v0.2.0",
+//     "body": "release notes",
+//     "assets": [ { "name": "NX-Nexus.nro",
+//                   "browser_download_url": "https://..." } ] }
+//
+// The tag is allowed a leading "v" because that is how tags are normally
+// written, while the version comparison wants bare numbers.
+static void parse_github_release(const JsonDoc *doc, u32 root)
+{
+    char tag[64] = {0};
+    jsonGetString(doc, jsonObjectGet(doc, root, "tag_name"), tag, sizeof(tag));
+
+    const char *version = (tag[0] == 'v' || tag[0] == 'V') ? tag + 1 : tag;
+    snprintf(g_state.available, sizeof(g_state.available), "%.20s", version);
+
+    jsonGetString(doc, jsonObjectGet(doc, root, "body"),
+                  g_state.notes, sizeof(g_state.notes));
+
+    // Take the first asset whose name ends in .nro. A release usually also
+    // carries a zip and checksums, and downloading one of those over the
+    // running homebrew would be actively harmful.
+    const u32 assets = jsonObjectGet(doc, root, "assets");
+    const u32 count  = jsonCount(doc, assets);
+
+    for (u32 i = 0; i < count; i++) {
+        const u32 asset = jsonAt(doc, assets, i);
+
+        char name[128] = {0};
+        if (!jsonGetString(doc, jsonObjectGet(doc, asset, "name"), name, sizeof(name))) {
+            continue;
+        }
+
+        const size_t n = strlen(name);
+        if (n < 4 || strcmp(name + (n - 4), ".nro") != 0) continue;
+
+        jsonGetString(doc, jsonObjectGet(doc, asset, "browser_download_url"),
+                      g_state.url, sizeof(g_state.url));
+        break;
+    }
+
+    if (g_state.url[0] == '\0') {
+        LOG_W("update: release %s carries no .nro asset", tag);
+    }
 }
 
 Result nexusUpdateCheck(void)
@@ -86,12 +157,20 @@ Result nexusUpdateCheck(void)
     }
 
     const u32 root = jsonRoot(doc);
-    jsonGetString(doc, jsonObjectGet(doc, root, "version"),
-                  g_state.available, sizeof(g_state.available));
-    jsonGetString(doc, jsonObjectGet(doc, root, "url"),
-                  g_state.url, sizeof(g_state.url));
-    jsonGetString(doc, jsonObjectGet(doc, root, "notes"),
-                  g_state.notes, sizeof(g_state.notes));
+
+    // A GitHub release document is recognised by tag_name, which the simple
+    // manifest never has. Supporting it means publishing a release is the
+    // entire update process -- no second file to keep in step.
+    if (jsonObjectGet(doc, root, "tag_name") != 0) {
+        parse_github_release(doc, root);
+    } else {
+        jsonGetString(doc, jsonObjectGet(doc, root, "version"),
+                      g_state.available, sizeof(g_state.available));
+        jsonGetString(doc, jsonObjectGet(doc, root, "url"),
+                      g_state.url, sizeof(g_state.url));
+        jsonGetString(doc, jsonObjectGet(doc, root, "notes"),
+                      g_state.notes, sizeof(g_state.notes));
+    }
     free(doc);
 
     if (g_state.available[0] == '\0' || g_state.url[0] == '\0') {
@@ -143,8 +222,11 @@ Result nexusUpdateApply(void)
     }
 
     // Download beside the target rather than over it.
-    const char *tmp   = NEXUS_UPDATE_PATH ".new";
-    const char *final = NEXUS_UPDATE_PATH;
+    char tmp[FS_MAX_PATH], backup[FS_MAX_PATH];
+    const char *final = g_self_path;
+
+    snprintf(tmp,    sizeof(tmp),    "%.*s.new", (int)(sizeof(tmp) - 8), g_self_path);
+    snprintf(backup, sizeof(backup), "%.*s.bak", (int)(sizeof(backup) - 8), g_self_path);
 
     remove(tmp);
 
@@ -183,12 +265,12 @@ Result nexusUpdateApply(void)
     fclose(f);
 
     // Keep the previous build so a bad update can be undone by hand.
-    remove(NEXUS_UPDATE_PATH ".bak");
-    rename(final, NEXUS_UPDATE_PATH ".bak");
+    remove(backup);
+    rename(final, backup);
 
     if (rename(tmp, final) != 0) {
         // Put the old one back rather than leaving nothing in place.
-        rename(NEXUS_UPDATE_PATH ".bak", final);
+        rename(backup, final);
         remove(tmp);
         snprintf(g_state.status, sizeof(g_state.status), "could not replace the .nro");
         return MAKERESULT(Module_Libnx, LibnxError_IoError);

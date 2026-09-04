@@ -10,6 +10,8 @@
 #include <stdbool.h>
 
 #define NEXUS_VERSION      "0.1.0"
+
+/// Where the .nro is assumed to live when the launcher does not say.
 #define NEXUS_UPDATE_PATH  "sdmc:/switch/NX-Nexus.nro"
 
 typedef struct {
@@ -28,6 +30,17 @@ typedef struct {
 } NexusUpdateState;
 
 const char *nexusUpdateVersion(void);
+
+/// Tells the updater where the running .nro actually is, from argv[0].
+///
+/// This matters more than it looks: installing through the Homebrew App Store
+/// puts the file in switch/NX-Nexus/, not switch/. Updating a hardcoded path
+/// would write a second copy that never runs, leaving the user on an old build
+/// that reports itself as updated. Ignores anything that is not an .nro path.
+void nexusUpdateSetSelfPath(const char *argv0);
+
+/// The path the updater will replace. Never NULL.
+const char *nexusUpdateSelfPath(void);
 
 /// Fetches and parses the manifest. Does not download anything large.
 Result nexusUpdateCheck(void);

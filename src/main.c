@@ -38,12 +38,18 @@
 #include "nexus/object_db.h"
 #include "nexus/install_horizon.h"
 #include "nexus/sysinfo.h"
+#include "nexus/compat.h"
 #include "nexus/http.h"
 #include "nexus/sources.h"
 #include "nexus/netinstall.h"
 #include "nexus/update.h"
 #include "nexus/maintenance.h"
 #include "nexus/firmware.h"
+#include "nexus/verify.h"
+#include "nexus/local_install.h"
+#include "nexus/xci_install.h"
+#include "nexus/title_list.h"
+#include "nexus/mods.h"
 
 #define WORKER_STACK_SIZE (64 * 1024)
 #define WORKER_PRIORITY   0x2C          // slightly above the default 0x2D
@@ -183,6 +189,7 @@ static const char *store_label(u32 storage_id)
         case NEXUS_STORAGE_SAVES:        return "5: Saves";
         case NEXUS_STORAGE_TITLES:       return "6: Installed Titles";
         case NEXUS_STORAGE_BIS:          return "7: NAND";
+        case NEXUS_STORAGE_ALBUM:        return "8: Album";
         default:                         return "Store";
     }
 }
@@ -242,6 +249,10 @@ typedef enum {
     Screen_Maintenance,
     Screen_Update,
     Screen_Firmware,
+    Screen_Local,
+    Screen_Titles,
+    Screen_Verify,
+    Screen_Mods,
     Screen_Log,
     Screen_About,
     Screen_Quit,
@@ -255,6 +266,11 @@ enum {
     Act_Maintenance,
     Act_Update,
     Act_Firmware,
+    Act_Local,
+    Act_Gamecard,
+    Act_Titles,
+    Act_Mods,
+    Act_VerifyAll,
     Act_Log,
     Act_About,
     Act_Quit,
@@ -273,10 +289,18 @@ enum {
     Act_Fw_Arm,
     Act_Fw_Install,
 
+    // Local install actions.
+    Act_Loc_Rescan = 400,
+
+    // Rows that stand for one entry in a list are a base plus an index.
+
     // Source rows are Act_Source_Base + index; item rows are
     // Act_Item_Base + index.
     Act_Source_Base = 1000,
     Act_Item_Base   = 5000,
+    Act_Local_Base  = 9000,
+    Act_Title_Base  = 20000,
+    Act_Mod_Base    = 40000,
 };
 
 // Where a network install should land. The SD card is the sane default and the
@@ -290,6 +314,27 @@ static char             g_action_msg[128] = "";
 static NexusFirmwareSet g_fw_set;
 static bool             g_fw_scanned = false;
 static bool             g_fw_armed = false;   // second-step confirmation
+
+// Local install (SD card) state.
+static NexusLocalList  *g_local = NULL;
+
+// Installed-title browser state.
+static NexusTitleList  *g_titles = NULL;
+static u8               g_title_sort   = NexusTitleSort_Name;
+static u8               g_title_filter = NexusTitleFilter_All;
+static int              g_title_armed  = -1;   // index armed for deletion
+
+// Mods and cheats.
+static NexusModList    *g_mods = NULL;
+static int              g_mod_armed = -1;
+
+// Verification.
+static NexusVerifyReport g_verify;
+static bool              g_verify_done = false;
+
+// Where an install from the SD card or a gamecard lands. Same default as the
+// network path: the SD card is what nearly everyone wants.
+#define LOCAL_INSTALL_TARGET NexusInstallTarget_SdCard
 
 
 // ---------------------------------------------------------------------------
@@ -530,6 +575,261 @@ static void draw_firmware(void)
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Install from the SD card or a gamecard
+// ---------------------------------------------------------------------------
+
+static void rescan_local(void)
+{
+    if (g_local == NULL) g_local = (NexusLocalList *)calloc(1, sizeof(*g_local));
+    if (g_local != NULL) nexusLocalScan(NEXUS_LOCAL_DIR, g_local);
+}
+
+static void build_local_menu(Menu *m)
+{
+    menuReset(m, UI_BODY_ROWS - 6);
+
+    NexusXciInfo card;
+    const bool have_card = R_SUCCEEDED(nexusXciInspectGameCard(&card)) && card.valid;
+
+    menuAddHeading(m, "Gamecard");
+    menuAdd(m, Act_Gamecard, "Install from the inserted gamecard",
+            have_card ? "ready" : "no card");
+
+    menuAddSpacer(m);
+    menuAddHeading(m, "SD card -- " NEXUS_LOCAL_DIR);
+    menuAdd(m, Act_Loc_Rescan, "Rescan", "");
+
+    if (g_local == NULL || g_local->count == 0) return;
+
+    for (u32 i = 0; i < g_local->count; i++) {
+        const NexusLocalItem *it = &g_local->items[i];
+
+        char detail[MENU_DETAIL_LEN];
+        char size[24];
+        fmt_bytes(size, sizeof(size), it->size);
+
+        if (it->kind == NexusLocalKind_SplitNsp) {
+            snprintf(detail, sizeof(detail), "%u parts, %.12s", it->parts, size);
+        } else {
+            snprintf(detail, sizeof(detail), "%.6s %.14s",
+                     nexusLocalKindStr(it->kind), size);
+        }
+
+        menuAdd(m, (int)(Act_Local_Base + i), it->name, detail);
+    }
+}
+
+static void draw_local(void)
+{
+    printf("\n");
+
+    if (g_local == NULL) {
+        printf("   " C_DIM "Choose Rescan to look for installable files." C_RESET "\n\n");
+        return;
+    }
+
+    printf("   " C_DIM "Put .nsp or .xci files in " NEXUS_LOCAL_DIR ". A split NSP is a"
+           C_RESET "\n");
+    printf("   " C_DIM "folder of numbered parts and works with or without the archive"
+           C_RESET "\n");
+    printf("   " C_DIM "bit set. Nothing is copied: bytes go straight into ncm."
+           C_RESET "\n\n");
+
+    if (g_local->count == 0) {
+        printf("   " C_WARN "Nothing installable found." C_RESET "\n\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Installed titles
+// ---------------------------------------------------------------------------
+
+static void rebuild_titles(void)
+{
+    if (g_titles == NULL) g_titles = (NexusTitleList *)calloc(1, sizeof(*g_titles));
+    if (g_titles == NULL) return;
+
+    nexusTitleListBuild(g_titles);
+    nexusTitleListSort(g_titles, g_title_sort);
+    g_title_armed = -1;
+}
+
+static void build_titles_menu(Menu *m)
+{
+    menuReset(m, UI_BODY_ROWS - 4);
+
+    if (g_titles == NULL) return;
+
+    for (u32 i = 0; i < g_titles->count; i++) {
+        const NexusTitleInfo *t = &g_titles->items[i];
+        if (!nexusTitleListMatches(t, g_title_filter)) continue;
+
+        char detail[MENU_DETAIL_LEN];
+        if ((int)i == g_title_armed) {
+            snprintf(detail, sizeof(detail), "X again = DELETE");
+        } else {
+            fmt_bytes(detail, sizeof(detail), t->size);
+        }
+
+        menuAdd(m, (int)(Act_Title_Base + i), t->name, detail);
+    }
+}
+
+static void draw_titles(void)
+{
+    printf("\n");
+
+    if (g_titles == NULL || g_titles->count == 0) {
+        printf("   " C_DIM "No installed titles found." C_RESET "\n\n");
+        return;
+    }
+
+    char total[24];
+    fmt_bytes(total, sizeof(total), g_titles->total_bytes);
+
+    printf("   %u title%s, %s installed        " C_DIM "sort: " C_RESET "%s"
+           "   " C_DIM "show: " C_RESET "%s\n\n",
+           g_titles->count, g_titles->count == 1 ? "" : "s", total,
+           nexusTitleSortStr(g_title_sort), nexusTitleFilterStr(g_title_filter));
+}
+
+// ---------------------------------------------------------------------------
+// Verification
+// ---------------------------------------------------------------------------
+
+// Redrawing on every chunk would cost more than the hashing, so the screen is
+// refreshed on a coarse counter. The same callback polls for a cancel, which is
+// why verification can be interrupted at all.
+static bool verify_tick(void *user, const NexusVerifyReport *r)
+{
+    PadState *pad = (PadState *)user;
+    static u32 ticks = 0;
+
+    if ((ticks++ & 0x0F) != 0) return true;
+
+    padUpdate(pad);
+    if (padGetButtonsDown(pad) & HidNpadButton_B) {
+        LOG_W("verify: cancelled by the user");
+        return false;
+    }
+
+    char done[24];
+    fmt_bytes(done, sizeof(done), r->bytes_done);
+
+    consoleClear();
+    draw_header("Verifying");
+    printf("\n   Title  " C_VALUE "%u of %u" C_RESET "\n", r->titles_done + 1,
+           r->titles_total);
+    printf("   Now    %.60s\n", r->current);
+    printf("   Hashed " C_VALUE "%s" C_RESET "\n\n", done);
+    printf("   Good   " C_OK "%u" C_RESET "     Bad  %s%u" C_RESET "\n",
+           r->contents_ok, r->contents_bad > 0 ? C_ERR : C_DIM, r->contents_bad);
+    printf("\n   " C_DIM "Reading every installed NCA and checking it against the"
+           C_RESET "\n");
+    printf("   " C_DIM "hash in its manifest. This takes a while." C_RESET "\n");
+    draw_footer("[B] stop");
+    consoleUpdate(NULL);
+    return true;
+}
+
+static void draw_verify(void)
+{
+    printf("\n");
+
+    if (!g_verify_done) {
+        printf("   " C_DIM "Nothing checked yet." C_RESET "\n");
+        return;
+    }
+
+    char done[24];
+    fmt_bytes(done, sizeof(done), g_verify.bytes_done);
+
+    printf("   Checked     " C_VALUE "%u title(s)" C_RESET ", %s hashed\n",
+           g_verify.titles_done, done);
+    printf("   Good        " C_OK "%u" C_RESET "\n", g_verify.contents_ok);
+    printf("   Bad         %s%u" C_RESET "\n\n",
+           g_verify.contents_bad > 0 ? C_ERR : C_DIM, g_verify.contents_bad);
+
+    if (g_verify.cancelled) {
+        printf("   " C_WARN "Stopped early -- the rest was not checked." C_RESET "\n\n");
+    }
+
+    if (g_verify.contents_bad == 0 && !g_verify.cancelled) {
+        printf("   " C_OK "Everything matches its manifest." C_RESET "\n");
+        return;
+    }
+
+    for (u32 i = 0; i < g_verify.issue_count && i < 10; i++) {
+        const NexusVerifyIssue *e = &g_verify.issues[i];
+        printf("   " C_ERR "%-10s" C_RESET " %.34s  " C_DIM "%.16s" C_RESET "\n",
+               nexusVerifyIssueStr(e->kind), e->title, e->content);
+    }
+
+    if (g_verify.issue_count > 10 || g_verify.issues_truncated) {
+        printf("   " C_DIM "...see the log for the rest." C_RESET "\n");
+    }
+
+    printf("\n   " C_DIM "Reinstall anything listed here. Corruption on an SD card"
+           C_RESET "\n");
+    printf("   " C_DIM "usually means the card itself is failing." C_RESET "\n");
+}
+
+// ---------------------------------------------------------------------------
+// Mods and cheats
+// ---------------------------------------------------------------------------
+
+static void rescan_mods(void)
+{
+    if (g_mods == NULL) g_mods = (NexusModList *)calloc(1, sizeof(*g_mods));
+    if (g_mods != NULL) nexusModsScan(g_mods);
+    g_mod_armed = -1;
+}
+
+static void build_mods_menu(Menu *m)
+{
+    menuReset(m, UI_BODY_ROWS - 5);
+
+    if (g_mods == NULL) return;
+
+    for (u32 i = 0; i < g_mods->count; i++) {
+        const NexusModEntry *e = &g_mods->entries[i];
+
+        char label[MENU_LABEL_LEN];
+        snprintf(label, sizeof(label), "%.28s %s%s%s",
+                 e->name,
+                 e->has_exefs  ? "exefs "  : "",
+                 e->has_romfs  ? "romfs "  : "",
+                 e->has_cheats ? "cheats"  : "");
+
+        char detail[MENU_DETAIL_LEN];
+        if ((int)i == g_mod_armed) {
+            snprintf(detail, sizeof(detail), "X again = DELETE");
+        } else {
+            snprintf(detail, sizeof(detail), "%s", e->enabled ? "enabled" : "disabled");
+        }
+
+        menuAdd(m, (int)(Act_Mod_Base + i), label, detail);
+    }
+}
+
+static void draw_mods(void)
+{
+    printf("\n");
+
+    if (g_mods == NULL || g_mods->count == 0) {
+        printf("   " C_DIM "No LayeredFS mods or cheat files found in" C_RESET "\n");
+        printf("   " C_DIM NEXUS_MODS_DIR "." C_RESET "\n\n");
+        return;
+    }
+
+    printf("   " C_DIM "Disabling renames the folder so Atmosphere skips it. Nothing"
+           C_RESET "\n");
+    printf("   " C_DIM "is moved or rewritten, and enabling puts the name back."
+           C_RESET "\n\n");
+}
+
 static void build_main_menu(Menu *m)
 {
     menuReset(m, UI_BODY_ROWS);
@@ -546,21 +846,35 @@ static void build_main_menu(Menu *m)
     menuAdd(m, Act_Transfer, "Transfer status", "");
 
     menuAddSpacer(m);
-    menuAddHeading(m, "Network");
+    menuAddHeading(m, "Install");
+
+    if (g_local != NULL && g_local->count > 0) {
+        snprintf(detail, sizeof(detail), "%u found", g_local->count);
+    } else {
+        detail[0] = '\0';
+    }
+    menuAdd(m, Act_Local, "Install from SD card or gamecard", detail);
 
     const NexusSourcesConfig *cfg = nexusSourcesGet();
     snprintf(detail, sizeof(detail), "%u configured", cfg->count);
     menuAdd(m, Act_Sources, "Install from a source", detail);
-    menuAdd(m, Act_Update,  "Check for updates",
-            nexusHttpIsReady() ? "" : "no network");
+
+    menuAddSpacer(m);
+    menuAddHeading(m, "Manage");
+
+    menuAdd(m, Act_Titles,    "Installed titles", "browse, delete");
+    menuAdd(m, Act_Mods,      "Mods and cheats",  "");
+    menuAdd(m, Act_VerifyAll, "Verify installed content", "");
+    menuAdd(m, Act_Maintenance, "Maintenance",  "");
 
     menuAddSpacer(m);
     menuAddHeading(m, "System");
-    menuAdd(m, Act_Maintenance, "Maintenance",  "");
-    menuAdd(m, Act_Firmware,    "Install firmware",
+    menuAdd(m, Act_Firmware, "Install firmware",
             nexusFirmwareInstallAllowed() ? "emuMMC" : "sysMMC - blocked");
-    menuAdd(m, Act_Log,         "Log",          "");
-    menuAdd(m, Act_About,       "About",        "");
+    menuAdd(m, Act_Update,   "Check for updates",
+            nexusHttpIsReady() ? "" : "no network");
+    menuAdd(m, Act_Log,      "Log",          "");
+    menuAdd(m, Act_About,    "About",        "");
 
     menuAddSpacer(m);
     menuAdd(m, Act_Quit, "Exit", "");
@@ -672,8 +986,10 @@ static void draw_about(void)
 
 int main(int argc, char *argv[])
 {
-    (void)argc;
-    (void)argv;
+    // argv[0] is where the launcher found this .nro, which is where a
+    // self-update has to write. Installing via the Homebrew App Store puts it
+    // somewhere other than the conventional path.
+    if (argc > 0 && argv != NULL) nexusUpdateSetSelfPath(argv[0]);
 
     consoleInit(NULL);
 
@@ -686,6 +1002,7 @@ int main(int argc, char *argv[])
     // Which NAND we booted from decides how several stores label themselves,
     // so this has to happen before the registry is built.
     nexusSysInfoInit();
+    nexusCompatInit();
 
     if (R_FAILED(psmInitialize())) LOG_W("psm: unavailable, battery will report 100");
 
@@ -782,12 +1099,48 @@ int main(int argc, char *argv[])
                             screen = Screen_Firmware;
                             break;
 
+                        case Act_Local:
+                            g_action_msg[0] = 0;
+                            consoleClear();
+                            draw_header("Install");
+                            printf("\n   Scanning...\n");
+                            consoleUpdate(NULL);
+                            rescan_local();
+                            build_local_menu(&sub);
+                            screen = Screen_Local;
+                            break;
+
+                        case Act_Titles:
+                            g_action_msg[0] = 0;
+                            consoleClear();
+                            draw_header("Installed titles");
+                            printf("\n   Reading the title database...\n");
+                            consoleUpdate(NULL);
+                            rebuild_titles();
+                            build_titles_menu(&sub);
+                            screen = Screen_Titles;
+                            break;
+
+                        case Act_Mods:
+                            g_action_msg[0] = 0;
+                            rescan_mods();
+                            build_mods_menu(&sub);
+                            screen = Screen_Mods;
+                            break;
+
+                        case Act_VerifyAll:
+                            nexusVerifyEverything(&g_verify, verify_tick, &pad);
+                            g_verify_done = true;
+                            screen = Screen_Verify;
+                            break;
+
                         default: break;
                     }
                 }
             } else if (screen == Screen_Sources || screen == Screen_Items
                        || screen == Screen_Maintenance || screen == Screen_Update
-                       || screen == Screen_Firmware) {
+                       || screen == Screen_Firmware || screen == Screen_Local
+                       || screen == Screen_Titles || screen == Screen_Mods) {
 
                 if (down & (HidNpadButton_Up   | HidNpadButton_StickLUp))   menuMove(&sub, -1);
                 if (down & (HidNpadButton_Down | HidNpadButton_StickLDown)) menuMove(&sub, 1);
@@ -807,10 +1160,128 @@ int main(int argc, char *argv[])
                     }
                 }
 
+                // Sorting and filtering live on the titles screen only. A
+                // change of either invalidates the armed deletion, since the
+                // row under the cursor is about to be a different title.
+                if (screen == Screen_Titles && g_titles != NULL) {
+                    if (down & HidNpadButton_Y) {
+                        g_title_sort = (u8)((g_title_sort + 1) % 3);
+                        nexusTitleListSort(g_titles, g_title_sort);
+                        g_title_armed = -1;
+                        build_titles_menu(&sub);
+                    }
+                    if (down & HidNpadButton_Minus) {
+                        g_title_filter = (u8)((g_title_filter + 1) % 4);
+                        g_title_armed = -1;
+                        build_titles_menu(&sub);
+                    }
+                }
+
+                // Deleting is two presses of X on the same row: the first arms
+                // it and says so in the row itself, the second carries it out.
+                if (down & HidNpadButton_X) {
+                    const int id = menuSelectedId(&sub);
+
+                    if (screen == Screen_Titles && g_titles != NULL
+                        && id >= Act_Title_Base) {
+                        const int idx = id - Act_Title_Base;
+
+                        if (idx != g_title_armed) {
+                            g_title_armed = idx;
+                            snprintf(g_action_msg, sizeof(g_action_msg),
+                                     "press X again to delete -- this cannot be undone");
+                        } else {
+                            const NexusTitleInfo *t = &g_titles->items[idx];
+                            char name[64];
+                            snprintf(name, sizeof(name), "%.60s", t->name);
+
+                            consoleClear();
+                            draw_header("Deleting");
+                            printf("\n   %s\n", name);
+                            consoleUpdate(NULL);
+
+                            const Result dr = nexusTitleListDelete(t);
+                            snprintf(g_action_msg, sizeof(g_action_msg), "%.50s: %s",
+                                     name, R_SUCCEEDED(dr) ? "deleted" : "delete failed");
+
+                            rebuild_titles();
+                            build_titles_menu(&sub);
+                        }
+                    } else if (screen == Screen_Mods && g_mods != NULL
+                               && id >= Act_Mod_Base) {
+                        const int idx = id - Act_Mod_Base;
+
+                        if (idx != g_mod_armed) {
+                            g_mod_armed = idx;
+                            snprintf(g_action_msg, sizeof(g_action_msg),
+                                     "press X again to delete this mod folder");
+                        } else {
+                            const Result dr = nexusModsDelete(&g_mods->entries[idx]);
+                            snprintf(g_action_msg, sizeof(g_action_msg), "%s",
+                                     R_SUCCEEDED(dr) ? "deleted" : "delete failed");
+                            rescan_mods();
+                            build_mods_menu(&sub);
+                        }
+                    }
+                }
+
                 if (down & HidNpadButton_A) {
                     const int id = menuSelectedId(&sub);
 
-                    if (id >= Act_Item_Base) {
+                    if (id >= Act_Mod_Base) {
+                        const u32 idx = (u32)(id - Act_Mod_Base);
+                        if (g_mods != NULL && idx < g_mods->count) {
+                            NexusModEntry *e = &g_mods->entries[idx];
+                            const bool want = !e->enabled;
+
+                            if (R_SUCCEEDED(nexusModsSetEnabled(e, want))) {
+                                snprintf(g_action_msg, sizeof(g_action_msg),
+                                         "%.40s %s", e->name,
+                                         want ? "enabled" : "disabled");
+                            } else {
+                                snprintf(g_action_msg, sizeof(g_action_msg),
+                                         "could not rename the folder");
+                            }
+                            g_mod_armed = -1;
+                            build_mods_menu(&sub);
+                        }
+                    } else if (id >= Act_Title_Base) {
+                        const u32 idx = (u32)(id - Act_Title_Base);
+                        if (g_titles != NULL && idx < g_titles->count) {
+                            const NexusTitleInfo *t = &g_titles->items[idx];
+
+                            memset(&g_verify, 0, sizeof(g_verify));
+                            g_verify.titles_total = 1;
+                            nexusVerifyContentMeta(&t->key, t->storage_id, t->name,
+                                                   &g_verify, verify_tick, &pad);
+                            g_verify.titles_done = 1;
+                            g_verify_done = true;
+                            g_title_armed = -1;
+                            screen = Screen_Verify;
+                        }
+                    } else if (id >= Act_Local_Base) {
+                        const u32 idx = (u32)(id - Act_Local_Base);
+                        if (g_local != NULL && idx < g_local->count) {
+                            const NexusLocalItem *it = &g_local->items[idx];
+
+                            consoleClear();
+                            draw_header("Installing");
+                            printf("\n   %.60s\n\n", it->name);
+                            printf("   Streaming into ncm. Nothing is copied first.\n");
+                            consoleUpdate(NULL);
+
+                            nexusLocalInstall(it, LOCAL_INSTALL_TARGET);
+
+                            // An XCI runs through the gamecard path and keeps
+                            // its status there rather than in the local state.
+                            const char *st = (it->kind == NexusLocalKind_Xci)
+                                ? nexusXciGetState()->status
+                                : nexusLocalGetState()->status;
+
+                            snprintf(g_action_msg, sizeof(g_action_msg), "%.40s: %.60s",
+                                     it->name, st);
+                        }
+                    } else if (id >= Act_Item_Base) {
                         const u32 idx = (u32)(id - Act_Item_Base);
                         if (idx < g_item_count) {
                             // Blocking on purpose: the screen says what is
@@ -872,6 +1343,41 @@ int main(int argc, char *argv[])
                                 nexusMaintenanceScan(&report);
                                 scanned = true;
                                 break;
+
+                            case Act_Loc_Rescan:
+                                rescan_local();
+                                build_local_menu(&sub);
+                                snprintf(g_action_msg, sizeof(g_action_msg),
+                                         "%u item(s) found",
+                                         g_local != NULL ? g_local->count : 0);
+                                break;
+
+                            case Act_Gamecard: {
+                                NexusXciInfo card;
+                                if (R_FAILED(nexusXciInspectGameCard(&card))
+                                    || !card.valid) {
+                                    snprintf(g_action_msg, sizeof(g_action_msg),
+                                             "%.100s", card.problem[0] != '\0'
+                                                 ? card.problem : "no gamecard");
+                                    break;
+                                }
+
+                                consoleClear();
+                                draw_header("Installing");
+                                printf("\n   Gamecard -- %u content(s)\n\n",
+                                       card.content_count);
+                                printf("   Reading the secure partition straight into"
+                                       " ncm.\n");
+                                printf("   Leave the card in the slot.\n");
+                                consoleUpdate(NULL);
+
+                                nexusXciInstallGameCard(LOCAL_INSTALL_TARGET);
+                                snprintf(g_action_msg, sizeof(g_action_msg),
+                                         "gamecard: %.90s",
+                                         nexusXciGetState()->status);
+                                build_local_menu(&sub);
+                                break;
+                            }
 
                             case Act_Upd_Check:
                                 consoleClear();
@@ -1022,6 +1528,36 @@ int main(int argc, char *argv[])
                     menuDraw(&sub);
                     draw_message_block();
                     draw_footer("[A] run   [B] back   [Up/Down] move");
+                    break;
+
+                case Screen_Local:
+                    draw_header("Install");
+                    draw_local();
+                    menuDraw(&sub);
+                    draw_message_block();
+                    draw_footer("[A] install   [B] back   [Up/Down] move");
+                    break;
+
+                case Screen_Titles:
+                    draw_header("Installed titles");
+                    draw_titles();
+                    menuDraw(&sub);
+                    draw_message_block();
+                    draw_footer("[A] verify  [X] delete  [Y] sort  [-] filter  [B] back");
+                    break;
+
+                case Screen_Verify:
+                    draw_header("Verify");
+                    draw_verify();
+                    draw_footer("[B] back   [+] quit");
+                    break;
+
+                case Screen_Mods:
+                    draw_header("Mods and cheats");
+                    draw_mods();
+                    menuDraw(&sub);
+                    draw_message_block();
+                    draw_footer("[A] enable/disable   [X] delete   [B] back");
                     break;
 
                 case Screen_Log:

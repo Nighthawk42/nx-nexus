@@ -44,3 +44,29 @@ Result nexusNsListApplicationRecordContentMeta(u64 offset, u64 application_id,
 /// PushApplicationRecord refuses to overwrite an existing record, so updating
 /// one means deleting it and pushing the merged list back.
 Result nexusNsDeleteApplicationRecord(u64 application_id);
+
+// ---------------------------------------------------------------------------
+// Helpers built on the three commands above
+// ---------------------------------------------------------------------------
+
+/// How many content storage records one application can hold: base, update and
+/// one per add-on. Set well above what a normal title needs, because
+/// overflowing it has to be a hard failure -- a truncated record list silently
+/// unregisters DLC the user already owns.
+#define NEXUS_NS_MAX_APP_RECORDS 320
+
+/// Reads every record attached to an application. Unlike
+/// ncmContentMetaDatabaseList, command 17 genuinely is paginated, so this
+/// loops until it stops returning entries. A title with no record yields 0
+/// rather than an error, since that is the normal fresh-install case.
+s32 nexusNsReadApplicationRecords(u64 application_id,
+                                  NexusContentStorageRecord *out, s32 max);
+
+/// Drops one content meta (matched on id and type) from an application's
+/// record, leaving everything else attached. Used to uninstall an update or a
+/// single add-on without disturbing the base game.
+///
+/// out_remaining, when not NULL, receives how many records the application has
+/// left -- zero means the whole record was removed.
+Result nexusNsRemoveContentMetaFromRecord(u64 application_id, u64 meta_id,
+                                          u8 meta_type, s32 *out_remaining);

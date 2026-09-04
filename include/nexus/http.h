@@ -28,6 +28,7 @@ typedef enum {
     NexusHttp_HttpStatus,     // server answered with >= 400
     NexusHttp_Aborted,        // the sink asked to stop
     NexusHttp_TooLarge,
+    NexusHttp_NoRangeSupport, // resume asked for; server sent the whole body
 } NexusHttpResult;
 
 const char *nexusHttpStr(NexusHttpResult r);
@@ -62,6 +63,20 @@ bool nexusHttpHasCaBundle(void);
 NexusHttpResult nexusHttpGet(const char *url, NexusHttpSink sink, void *sink_user,
                              NexusHttpProgress progress, void *progress_user,
                              long *status_out);
+
+/// As nexusHttpGet, but asks the server to start at a byte offset.
+///
+/// The progress callback still reports bytes received *in this request*, so a
+/// caller resuming a transfer has to add the offset back on for a total.
+///
+/// A server that ignores Range answers 200 with the whole body instead of 206.
+/// That is detected and reported as NexusHttp_NoRangeSupport rather than
+/// silently feeding duplicate bytes into whatever is consuming the stream --
+/// which, for an installer, would corrupt the install.
+NexusHttpResult nexusHttpGetFrom(const char *url, u64 start_offset,
+                                 NexusHttpSink sink, void *sink_user,
+                                 NexusHttpProgress progress, void *progress_user,
+                                 long *status_out);
 
 /// Fetches a small resource wholly into a buffer -- for index documents, not
 /// for titles. Fails with NexusHttp_TooLarge rather than truncating.

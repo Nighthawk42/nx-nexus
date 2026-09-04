@@ -28,6 +28,7 @@ const char *nexusHttpStr(NexusHttpResult r)
         case NexusHttp_HttpStatus:     return "server returned an error";
         case NexusHttp_Aborted:        return "aborted";
         case NexusHttp_TooLarge:       return "response too large";
+        case NexusHttp_NoRangeSupport: return "server cannot resume";
         default:                       return "unknown";
     }
 }
@@ -177,9 +178,10 @@ static int progress_cb(void *userdata, curl_off_t dltotal, curl_off_t dlnow,
     return 0;
 }
 
-NexusHttpResult nexusHttpGet(const char *url, NexusHttpSink sink, void *sink_user,
-                             NexusHttpProgress progress, void *progress_user,
-                             long *status_out)
+NexusHttpResult nexusHttpGetFrom(const char *url, u64 start_offset,
+                                 NexusHttpSink sink, void *sink_user,
+                                 NexusHttpProgress progress, void *progress_user,
+                                 long *status_out)
 {
     if (!g_initialised) return NexusHttp_NotInitialised;
     if (sink == NULL)   return NexusHttp_BadUrl;
@@ -195,6 +197,10 @@ NexusHttpResult nexusHttpGet(const char *url, NexusHttpSink sink, void *sink_use
 
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, stream_write);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &sctx);
+
+    if (start_offset > 0) {
+        curl_easy_setopt(curl, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)start_offset);
+    }
 
     if (progress != NULL) {
         curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
@@ -221,7 +227,24 @@ NexusHttpResult nexusHttpGet(const char *url, NexusHttpSink sink, void *sink_use
         return NexusHttp_HttpStatus;
     }
 
+    // 206 is the only correct answer to a Range request. A server that ignores
+    // it and sends 200 has just replayed the whole file from byte zero -- and
+    // the sink has already been handed those bytes as though they continued
+    // from the offset. Say so instead of pretending the resume worked.
+    if (start_offset > 0 && status != 206) {
+        LOG_E("http: resume asked for at %llu but the server answered %ld",
+              (unsigned long long)start_offset, status);
+        return NexusHttp_NoRangeSupport;
+    }
+
     return NexusHttp_Ok;
+}
+
+NexusHttpResult nexusHttpGet(const char *url, NexusHttpSink sink, void *sink_user,
+                             NexusHttpProgress progress, void *progress_user,
+                             long *status_out)
+{
+    return nexusHttpGetFrom(url, 0, sink, sink_user, progress, progress_user, status_out);
 }
 
 // ---------------------------------------------------------------------------

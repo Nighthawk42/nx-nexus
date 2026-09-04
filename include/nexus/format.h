@@ -41,10 +41,14 @@ u64 nexusRdU64(const void *base, size_t off);
 /// Reads a 40-bit little-endian value. CNMT stores content sizes this way.
 u64 nexusRdU40(const void *base, size_t off);
 
-/// Checked addition. Returns false when a + b would wrap.
+/// Checked addition. Returns **true** when a + b would wrap, in which case
+/// *out is untouched; returns false and writes the sum otherwise. The name is
+/// the predicate, so the guard reads:
+///
+///     if (nexusAddOverflows(a, b, &sum)) return NexusFmt_Overflow;
 bool nexusAddOverflows(u64 a, u64 b, u64 *out);
 
-/// Checked multiplication. Returns false when a * b would wrap.
+/// Checked multiplication, with the same sense: true means it would wrap.
 bool nexusMulOverflows(u64 a, u64 b, u64 *out);
 
 // ---------------------------------------------------------------------------

@@ -55,7 +55,7 @@ LDFLAGS =   -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir 
 
 # curl (with mbedtls) comes from devkitPro portlibs and is already present in
 # the toolchain image. Link order matters: curl, then its TLS backend, then z.
-LIBS    := -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz -lnx
+LIBS    := -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lzstd -lz -lnx
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing
