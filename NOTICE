@@ -1,0 +1,125 @@
+NX-Nexus — licensing and third-party attributions
+=================================================
+
+NX-Nexus is licensed **GPL-3.0-or-later**. See LICENSE for the full text.
+
+The licence was chosen deliberately, not by default. GPL-3.0 is the only
+licence under which the whole intended component set can lawfully be combined:
+
+  - Goldleaf and nxdumptool are GPL-3.0-or-later (verified from their own
+    per-file headers). Their copyleft requires any work derived from them to be
+    GPL-3.0-compatible.
+  - libusbhsfs's full-featured build is GPLv2-or-later, which the "or later"
+    clause allows to be combined under GPL-3.0.
+  - mtp-server-nx is Apache-2.0. Apache-2.0 is compatible with **GPLv3 but not
+    GPLv2**, because of its patent and notice terms. This is the specific
+    reason the project is GPLv3 rather than GPLv2.
+  - libnx (ISC) and Dear ImGui (MIT) are permissive and impose no constraint.
+
+See docs/PLAN-REVIEW.md §1 for the full reasoning and the alternatives that
+were rejected.
+
+
+Licence compatibility summary
+-----------------------------
+
+  Component        Upstream licence      Combinable into GPL-3.0-or-later?
+  ---------------  --------------------  ---------------------------------
+  libnx            ISC                   yes (permissive)
+  Dear ImGui       MIT                   yes (permissive)
+  mtp-server-nx    Apache-2.0            yes, GPLv3 only (not GPLv2)
+  libusbhsfs       ISC or GPLv2+         yes (either build)
+  Goldleaf         GPL-3.0-or-later      yes
+  nxdumptool       GPL-3.0-or-later      yes
+  "Tinwoo"         none declared         NO — see below
+
+Because GPL-3.0-or-later code is incorporated, distributed binaries must be
+accompanied by, or offered, their complete corresponding source. Keep the
+repository public and reference it from releases.
+
+
+The one thing no licence choice can fix
+---------------------------------------
+
+The original blueprint listed "Huntereb/Tinwoo" as a source for PFS0 and NCA
+handling. That repository does not exist, and the surviving forks
+(falcorr/TinWoo, daz2048/TinWoo) declare **no licence at all**.
+
+No licence means no grant of rights. Unlike the GPL projects, this is not
+solved by relicensing NX-Nexus — there is simply no permission to copy that
+code under any terms. Tinwoo must not be used as a source, and its absence is
+the reason Phase 2's PFS0/NCA work still has to come from either the switchbrew
+wiki or from Goldleaf/nxdumptool (both now permissible).
+
+
+Linked / build dependencies
+---------------------------
+
+devkitA64 and devkitPro toolchain
+  https://github.com/devkitPro
+  Components under their respective licences. Using a GPL compiler imposes no
+  licence obligation on compiled output; the GPL here comes from the libraries
+  and code described above, not the toolchain.
+
+libnx
+  https://github.com/switchbrew/libnx
+  ISC License. Linked as a static library. Permissive, GPL-compatible.
+
+
+Derived work currently in this repository
+-----------------------------------------
+
+src/usb/usb_transport.c
+  The usb:ds initialisation sequence — string and device descriptor setup, the
+  per-speed AppendConfigurationData ordering, SuperSpeed companion descriptor
+  placement, derivation of endpoint addresses from the interface index, and the
+  PostBufferAsync / CompletionEvent / GetReportData / ParseReportData transfer
+  cycle — follows the reference implementation in libnx's
+  nx/source/runtime/devices/usb_comms.c (ISC License, switchbrew/libnx),
+  retargeted from the vendor-specific class to the USB Still Image class.
+
+  ISC is permissive; this attribution satisfies it, and the file is
+  redistributed here as part of a GPL-3.0-or-later work.
+
+include/nexus/mtp_types.h
+  MTP and PTP protocol constants transcribed from the public PIMA 15740:2000
+  specification and Microsoft's published MTP extension. Protocol numbers are
+  facts about a wire format, not copyrightable expression.
+
+src/horizon/fs_ext.c
+  nexusFsOpenGameCardStorage is ported from nxdumptool's source/core/fs_ext.c
+  (Copyright DarkMatterCore and contributors, GPL-3.0-or-later). libnx wraps
+  fsOpenGameCardFileSystem but not the raw-sector fsp-srv command 30, which is
+  what a byte-exact XCI dump requires.
+
+  Modified 2026-09-03: renamed to nexusFsOpenGameCardStorage to carry this
+  project's prefix, and the partition argument given a named enum. The IPC
+  itself is unchanged.
+
+src/horizon/sysinfo.c
+  The Exosphere SPL configuration item used to detect an emuMMC boot
+  (item 65007, ExosphereEmummcType) was identified from nxdumptool's
+  source/core/nxdt_utils.c (GPL-3.0-or-later). The surrounding code is
+  original.
+
+Everything else in this repository is original work by the NX-Nexus
+contributors. Nothing has been copied from Goldleaf, libusbhsfs or
+mtp-server-nx. Goldleaf's NSP installer was read to confirm that the Meta NCA's
+own content info has to be constructed by hand rather than read from the CNMT,
+but no code was taken from it.
+
+
+Recording future imports
+------------------------
+
+When code is imported from any of the now-permissible upstreams:
+
+  1. Keep the original file's copyright and licence header intact. Do not
+     replace an upstream author's notice with a NX-Nexus one.
+  2. For Apache-2.0 files (mtp-server-nx), retain the Apache notices and any
+     NOTICE content the upstream ships; Apache-2.0 files stay Apache-2.0 inside
+     the GPLv3 combined work rather than being relabelled.
+  3. Add an entry to this file naming the upstream project, the files taken,
+     and the upstream licence.
+  4. Note any modifications, as GPL section 5(a) requires modified files to
+     carry prominent notice of the change and its date.

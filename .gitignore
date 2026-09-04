@@ -1,0 +1,26 @@
+# Build output
+/build/
+*.nro
+*.nso
+*.nsp
+*.nacp
+*.npdm
+*.elf
+*.map
+
+# devkitPro intermediates
+*.o
+*.d
+*.lst
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Host test artifacts
+/tests/nexus-tests
+/tests/obj/

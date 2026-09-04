@@ -1,0 +1,75 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed by the release job on tag pushes
+
+jobs:
+  # Host-side parser tests run first and on a plain runner: they need only a
+  # C compiler, and a parser regression should fail fast rather than after a
+  # full cross-compile.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run container parser tests (ASan + UBSan)
+        run: make -C tests run
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    container:
+      # Pin this to a dated tag (e.g. devkitpro/devkita64:20260219) once the
+      # project has a release, so a toolchain bump cannot break a rebuild of
+      # an old tag.
+      image: devkitpro/devkita64:latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain versions
+        run: |
+          echo "DEVKITPRO=$DEVKITPRO"
+          "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-gcc" --version | head -1
+          make --version | head -1
+
+      # -Werror is applied here rather than in the Makefile so a local
+      # exploratory build is not blocked by a warning, while CI stays strict.
+      - name: Build
+        run: make -j"$(nproc)" CFLAGS_EXTRA=-Werror
+
+      - name: Verify NRO header
+        run: |
+          test -f NX-Nexus.nro
+          magic=$(dd if=NX-Nexus.nro bs=1 skip=16 count=4 2>/dev/null)
+          echo "magic: $magic"
+          test "$magic" = "NRO0"
+          ls -l NX-Nexus.nro
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NX-Nexus-nro
+          path: NX-Nexus.nro
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: NX-Nexus-nro
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: NX-Nexus.nro
+          generate_release_notes: true

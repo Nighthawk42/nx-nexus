@@ -1,0 +1,928 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// NX-Nexus -- MTP server and streaming installer for the Nintendo Switch.
+// Copyright (C) 2026 NX-Nexus contributors
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// NX-Nexus -- entry point and console UI.
+//
+// The USB interface is NOT brought up at launch. Publishing an MTP device the
+// moment the app opens means the console appears on whatever it is plugged
+// into without anyone asking for it, so the server is started explicitly from
+// the menu and torn down again on stop.
+//
+// While the server runs the MTP responder lives on its own thread with
+// blocking USB reads; the main thread only draws and reads input.
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "nexus/log.h"
+#include "nexus/menu.h"
+#include "nexus/usb_transport.h"
+#include "nexus/mtp_server.h"
+#include "nexus/storage.h"
+#include "nexus/object_db.h"
+#include "nexus/install_horizon.h"
+#include "nexus/sysinfo.h"
+#include "nexus/http.h"
+#include "nexus/sources.h"
+#include "nexus/netinstall.h"
+#include "nexus/update.h"
+#include "nexus/maintenance.h"
+
+#define WORKER_STACK_SIZE (64 * 1024)
+#define WORKER_PRIORITY   0x2C          // slightly above the default 0x2D
+
+#define UI_WIDTH      79
+#define UI_BODY_ROWS  22
+
+#define C_RESET  "\x1b[0m"
+#define C_DIM    "\x1b[37m"
+#define C_TITLE  "\x1b[36m"
+#define C_OK     "\x1b[32m"
+#define C_WARN   "\x1b[33m"
+#define C_ERR    "\x1b[31m"
+#define C_VALUE  "\x1b[97m"
+
+// ---------------------------------------------------------------------------
+// MTP worker
+// ---------------------------------------------------------------------------
+
+static Thread        g_worker;
+static volatile bool g_worker_run = false;
+static bool          g_worker_started = false;
+static bool          g_server_up = false;
+
+static void worker_main(void *arg)
+{
+    (void)arg;
+    LOG_I("worker: started");
+
+    while (g_worker_run) {
+        if (!usbTransportIsReady()) {
+            if (mtpServerGetState()->session_open) mtpServerResetSession();
+            svcSleepThread(100000000ull);   // 100 ms
+            continue;
+        }
+
+        Result rc = mtpServerRunOnce(UINT64_MAX);
+        if (R_FAILED(rc) && g_worker_run) {
+            LOG_D("worker: transaction ended with 0x%x", rc);
+            svcSleepThread(50000000ull);
+        }
+    }
+
+    LOG_I("worker: stopped");
+}
+
+// Brings up USB and the responder. Nothing is published to a host until this
+// runs, which is the whole point of not auto-starting.
+static bool server_start(void)
+{
+    if (g_server_up) return true;
+
+    if (R_FAILED(usbTransportInit())) {
+        LOG_E("server: USB init failed -- is another USB homebrew running?");
+        return false;
+    }
+    if (R_FAILED(mtpServerInit())) {
+        LOG_E("server: MTP init failed");
+        usbTransportExit();
+        return false;
+    }
+
+    g_worker_run = true;
+    if (R_FAILED(threadCreate(&g_worker, worker_main, NULL, NULL,
+                              WORKER_STACK_SIZE, WORKER_PRIORITY, -2))
+        || R_FAILED(threadStart(&g_worker))) {
+        LOG_E("server: could not start the worker thread");
+        g_worker_run = false;
+        mtpServerExit();
+        usbTransportExit();
+        return false;
+    }
+
+    g_worker_started = true;
+    g_server_up      = true;
+    LOG_I("server: started -- the console is now visible over USB");
+    return true;
+}
+
+static void server_stop(void)
+{
+    if (!g_server_up) return;
+
+    if (g_worker_started) {
+        g_worker_run = false;
+        usbTransportCancel();       // unblock the parked USB read
+        threadWaitForExit(&g_worker);
+        threadClose(&g_worker);
+        g_worker_started = false;
+    }
+
+    mtpServerExit();
+    usbTransportExit();
+    g_server_up = false;
+    LOG_I("server: stopped -- no longer visible over USB");
+}
+
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
+
+static const char *speed_name(UsbDeviceSpeed speed)
+{
+    switch (speed) {
+        case UsbDeviceSpeed_Low:   return "USB 1.0";
+        case UsbDeviceSpeed_Full:  return "USB 1.1";
+        case UsbDeviceSpeed_High:  return "USB 2.0";
+        case UsbDeviceSpeed_Super: return "USB 3.0";
+        default:                   return "-";
+    }
+}
+
+static void fmt_bytes(char *out, size_t out_size, u64 bytes)
+{
+    if (bytes >= (1ull << 30)) {
+        snprintf(out, out_size, "%llu.%01llu GiB",
+                 (unsigned long long)(bytes >> 30),
+                 (unsigned long long)(((bytes % (1ull << 30)) * 10) >> 30));
+    } else if (bytes >= (1ull << 20)) {
+        snprintf(out, out_size, "%llu.%01llu MiB",
+                 (unsigned long long)(bytes >> 20),
+                 (unsigned long long)(((bytes % (1ull << 20)) * 10) >> 20));
+    } else if (bytes >= 1024) {
+        snprintf(out, out_size, "%llu KiB", (unsigned long long)(bytes >> 10));
+    } else {
+        snprintf(out, out_size, "%llu B", (unsigned long long)bytes);
+    }
+}
+
+static const char *store_label(u32 storage_id)
+{
+    switch (storage_id) {
+        case NEXUS_STORAGE_SDMC:         return "1: MicroSD";
+        case NEXUS_STORAGE_INSTALL_SD:   return "2: MicroSD Install";
+        case NEXUS_STORAGE_INSTALL_NAND: return "3: System Install";
+        case NEXUS_STORAGE_GAMECARD:     return "4: Game Card";
+        case NEXUS_STORAGE_SAVES:        return "5: Saves";
+        case NEXUS_STORAGE_TITLES:       return "6: Installed Titles";
+        case NEXUS_STORAGE_BIS:          return "7: NAND";
+        default:                         return "Store";
+    }
+}
+
+static void draw_rule(char edge)
+{
+    putchar(' ');
+    putchar(edge);
+    for (int i = 0; i < UI_WIDTH - 2; i++) putchar('-');
+    putchar(edge);
+    putchar('\n');
+}
+
+static void draw_header(const char *screen)
+{
+    draw_rule('=');
+    printf(" " C_TITLE "NX-Nexus" C_RESET " " C_DIM "0.1.0-dev" C_RESET
+           "   %-22s " C_DIM "%s | fw %s" C_RESET "\n",
+           screen,
+           nexusSysInfoStorageName(),
+           nexusSysInfoFirmware()[0] != '\0' ? nexusSysInfoFirmware() : "?");
+
+    // One always-visible line for server state, so whether the console is
+    // exposed over USB is never a surprise.
+    if (!g_server_up) {
+        printf(" " C_DIM "Server: stopped -- not visible over USB" C_RESET "\n");
+    } else if (usbTransportIsReady()) {
+        const MtpServerState *st = mtpServerGetState();
+        char rate[24];
+        fmt_bytes(rate, sizeof(rate), st->stats.last_rate_bps);
+        printf(" " C_OK "Server: connected" C_RESET "  %s  %s/s\n",
+               speed_name(usbTransportGetSpeed()), rate);
+    } else {
+        printf(" " C_WARN "Server: running -- waiting for a host" C_RESET "\n");
+    }
+
+    draw_rule('=');
+}
+
+static void draw_footer(const char *hints)
+{
+    draw_rule('=');
+    printf(" " C_DIM "%s" C_RESET "\n", hints);
+    printf(" " C_DIM "GPLv3+, ABSOLUTELY NO WARRANTY. See LICENSE." C_RESET "\n");
+}
+
+// ---------------------------------------------------------------------------
+// Screens
+// ---------------------------------------------------------------------------
+
+typedef enum {
+    Screen_Main = 0,
+    Screen_Stores,
+    Screen_Transfer,
+    Screen_Sources,
+    Screen_Items,
+    Screen_Maintenance,
+    Screen_Update,
+    Screen_Log,
+    Screen_About,
+    Screen_Quit,
+} Screen;
+
+enum {
+    Act_ToggleServer = 1,
+    Act_Stores,
+    Act_Transfer,
+    Act_Sources,
+    Act_Maintenance,
+    Act_Update,
+    Act_Log,
+    Act_About,
+    Act_Quit,
+
+    // Maintenance actions.
+    Act_Mnt_Scan = 100,
+    Act_Mnt_Placeholders,
+    Act_Mnt_Orphans,
+
+    // Update actions.
+    Act_Upd_Check = 200,
+    Act_Upd_Apply,
+
+    // Source rows are Act_Source_Base + index; item rows are
+    // Act_Item_Base + index.
+    Act_Source_Base = 1000,
+    Act_Item_Base   = 5000,
+};
+
+// Where a network install should land. The SD card is the sane default and the
+// only one most people want.
+#define NET_INSTALL_TARGET NexusInstallTarget_SdCard
+
+static NexusSourceItem *g_items = NULL;
+static u32              g_item_count = 0;
+static int              g_source_index = -1;
+static char             g_action_msg[128] = "";
+
+
+// ---------------------------------------------------------------------------
+// Network screens
+// ---------------------------------------------------------------------------
+
+static void build_sources_menu(Menu *m)
+{
+    menuReset(m, UI_BODY_ROWS - 4);
+
+    const NexusSourcesConfig *cfg = nexusSourcesGet();
+    if (cfg->count == 0) {
+        menuAddHeading(m, "No sources configured.");
+        menuAddSpacer(m);
+        menuAddHeading(m, "Edit sdmc:/switch/nx-nexus/sources.json and add your own.");
+        return;
+    }
+
+    for (u32 i = 0; i < cfg->count; i++) {
+        menuAdd(m, (int)(Act_Source_Base + i), cfg->sources[i].name, "");
+    }
+}
+
+// Fetches and parses a source index into g_items.
+static void load_source_items(u32 index)
+{
+    const NexusSourcesConfig *cfg = nexusSourcesGet();
+    if (index >= cfg->count) return;
+
+    free(g_items);
+    g_items = NULL;
+    g_item_count = 0;
+
+    if (!nexusHttpIsReady()) {
+        snprintf(g_action_msg, sizeof(g_action_msg), "networking is not up");
+        return;
+    }
+
+    char *buf = (char *)malloc(NEXUS_SOURCE_INDEX_MAX);
+    if (buf == NULL) {
+        snprintf(g_action_msg, sizeof(g_action_msg), "out of memory");
+        return;
+    }
+
+    size_t len = 0;
+    long status = 0;
+    const NexusHttpResult hr = nexusHttpGetBuffer(cfg->sources[index].url, buf,
+                                                  NEXUS_SOURCE_INDEX_MAX - 1, &len, &status);
+    if (hr != NexusHttp_Ok) {
+        snprintf(g_action_msg, sizeof(g_action_msg), "%s (%ld)", nexusHttpStr(hr), status);
+        free(buf);
+        return;
+    }
+
+    g_items = (NexusSourceItem *)calloc(NEXUS_SOURCE_ITEMS_MAX, sizeof(NexusSourceItem));
+    if (g_items == NULL) {
+        snprintf(g_action_msg, sizeof(g_action_msg), "out of memory");
+        free(buf);
+        return;
+    }
+
+    const NexusFmtResult r = nexusSourcesParseIndex(buf, len, g_items,
+                                                    NEXUS_SOURCE_ITEMS_MAX, &g_item_count);
+    free(buf);
+
+    if (r != NexusFmt_Ok) {
+        snprintf(g_action_msg, sizeof(g_action_msg), "index: %s", nexusFmtStr(r));
+        free(g_items);
+        g_items = NULL;
+        g_item_count = 0;
+        return;
+    }
+
+    snprintf(g_action_msg, sizeof(g_action_msg), "%u item(s)", g_item_count);
+    LOG_I("sources: %s listed %u item(s)", cfg->sources[index].name, g_item_count);
+}
+
+static void build_items_menu(Menu *m)
+{
+    menuReset(m, UI_BODY_ROWS - 4);
+
+    if (g_item_count == 0) {
+        menuAddHeading(m, g_action_msg[0] != '\0' ? g_action_msg : "Nothing listed.");
+        return;
+    }
+
+    for (u32 i = 0; i < g_item_count; i++) {
+        char detail[MENU_DETAIL_LEN];
+        if (g_items[i].size > 0) fmt_bytes(detail, sizeof(detail), g_items[i].size);
+        else                     detail[0] = '\0';
+
+        menuAdd(m, (int)(Act_Item_Base + i), g_items[i].name, detail);
+    }
+}
+
+static void build_maintenance_menu(Menu *m)
+{
+    menuReset(m, UI_BODY_ROWS - 4);
+    menuAdd(m, Act_Mnt_Scan,         "Scan for leftover data",       "");
+    menuAdd(m, Act_Mnt_Placeholders, "Clear stray placeholders",     "");
+    menuAdd(m, Act_Mnt_Orphans,      "Remove redundant title data",  "");
+}
+
+static void build_update_menu(Menu *m)
+{
+    menuReset(m, UI_BODY_ROWS - 6);
+
+    const NexusUpdateState *u = nexusUpdateGetState();
+    menuAdd(m, Act_Upd_Check, "Check now", "");
+
+    if (u->checked && u->available_is_newer) {
+        menuAdd(m, Act_Upd_Apply, "Download and install", u->available);
+    }
+}
+
+static void draw_message_block(void)
+{
+    if (g_action_msg[0] == '\0') return;
+    printf("\n   " C_WARN "%s" C_RESET "\n", g_action_msg);
+}
+
+static void draw_sources_intro(void)
+{
+    // The policy is stated where the feature is used, not only in the docs.
+    printf("\n   " C_DIM "Sources are yours alone. Nothing ships configured, and" C_RESET "\n");
+    printf("   " C_DIM "public \"free shops\" are not supported or endorsed." C_RESET "\n");
+    printf("   " C_DIM "Point this at your own server." C_RESET "\n\n");
+}
+
+static void draw_update(void)
+{
+    const NexusUpdateState *u = nexusUpdateGetState();
+
+    printf("\n   Installed   " C_VALUE "%s" C_RESET "\n", u->installed);
+
+    if (u->checked) {
+        printf("   Available   " C_VALUE "%s" C_RESET "\n", u->available);
+        if (u->notes[0] != '\0') {
+            printf("   Notes       " C_DIM "%s" C_RESET "\n", u->notes);
+        }
+    }
+    if (u->status[0] != '\0') {
+        printf("   Status      %s\n", u->status);
+    }
+
+    if (u->total > 0 && u->received < u->total) {
+        char got[24], tot[24];
+        fmt_bytes(got, sizeof(got), u->received);
+        fmt_bytes(tot, sizeof(tot), u->total);
+        printf("   Progress    " C_VALUE "%s / %s" C_RESET "\n", got, tot);
+    }
+
+    printf("\n   " C_DIM "The update source is \"update_url\" in sources.json." C_RESET "\n");
+    printf("   " C_DIM "Nothing is ever checked automatically." C_RESET "\n");
+}
+
+static void draw_maintenance(const NexusMaintenanceReport *rep, bool scanned)
+{
+    printf("\n");
+
+    if (scanned) {
+        char ph[24], freesp[24];
+        fmt_bytes(ph, sizeof(ph), rep->placeholder_bytes);
+        fmt_bytes(freesp, sizeof(freesp), rep->free_bytes);
+
+        printf("   Stray placeholders  " C_VALUE "%u" C_RESET " (%s)\n",
+               rep->placeholders, ph);
+        printf("   Free space          " C_VALUE "%s" C_RESET "\n\n", freesp);
+    } else {
+        printf("   " C_DIM "Run a scan to see what is reclaimable." C_RESET "\n\n");
+    }
+}
+
+static void build_main_menu(Menu *m)
+{
+    menuReset(m, UI_BODY_ROWS);
+
+    char detail[MENU_DETAIL_LEN];
+    snprintf(detail, sizeof(detail), "%s", g_server_up ? "running" : "stopped");
+    menuAdd(m, Act_ToggleServer,
+            g_server_up ? "Stop MTP server" : "Start MTP server", detail);
+
+    menuAddSpacer(m);
+
+    snprintf(detail, sizeof(detail), "%zu", nexusStorageCount());
+    menuAdd(m, Act_Stores,   "Stores",          detail);
+    menuAdd(m, Act_Transfer, "Transfer status", "");
+
+    menuAddSpacer(m);
+    menuAddHeading(m, "Network");
+
+    const NexusSourcesConfig *cfg = nexusSourcesGet();
+    snprintf(detail, sizeof(detail), "%u configured", cfg->count);
+    menuAdd(m, Act_Sources, "Install from a source", detail);
+    menuAdd(m, Act_Update,  "Check for updates",
+            nexusHttpIsReady() ? "" : "no network");
+
+    menuAddSpacer(m);
+    menuAddHeading(m, "System");
+    menuAdd(m, Act_Maintenance, "Maintenance",  "");
+    menuAdd(m, Act_Log,         "Log",          "");
+    menuAdd(m, Act_About,       "About",        "");
+
+    menuAddSpacer(m);
+    menuAdd(m, Act_Quit, "Exit", "");
+}
+
+static void draw_stores(void)
+{
+    printf("\n");
+    for (size_t i = 0; i < nexusStorageCount(); i++) {
+        NexusStorage *s = nexusStorageAt(i);
+        if (s == NULL) continue;
+
+        printf("   %-22s %s%-13s" C_RESET,
+               store_label(s->storage_id),
+               s->present ? C_OK : C_DIM,
+               s->present ? "available" : "unavailable");
+
+        if (s->present && s->ops->get_info != NULL) {
+            NexusStorageInfo info;
+            if (R_SUCCEEDED(s->ops->get_info(s, &info)) && info.capacity_bytes > 0) {
+                char cap[24], freesp[24];
+                fmt_bytes(cap, sizeof(cap), info.capacity_bytes);
+                fmt_bytes(freesp, sizeof(freesp), info.free_bytes);
+                printf(C_DIM "%s free of %s" C_RESET, freesp, cap);
+            }
+        }
+        printf("\n");
+    }
+
+    printf("\n   " C_DIM "Stores appear on the host once the server is running." C_RESET "\n");
+}
+
+static void draw_transfer(void)
+{
+    const MtpServerState *st = mtpServerGetState();
+    char in_s[24], out_s[24], rate_s[24];
+
+    fmt_bytes(in_s,   sizeof(in_s),   st->stats.bytes_in);
+    fmt_bytes(out_s,  sizeof(out_s),  st->stats.bytes_out);
+    fmt_bytes(rate_s, sizeof(rate_s), st->stats.last_rate_bps);
+
+    printf("\n");
+    printf("   Session     %s%s" C_RESET "\n",
+           st->session_open ? C_OK : C_DIM,
+           st->session_open ? "open" : "closed");
+    printf("   Received    " C_VALUE "%s" C_RESET "\n", in_s);
+    printf("   Sent        " C_VALUE "%s" C_RESET "\n", out_s);
+    printf("   Last rate   " C_VALUE "%s/s" C_RESET "\n", rate_s);
+    printf("   Operations  " C_VALUE "%u" C_RESET "\n", st->stats.operations);
+    printf("   Errors      %s%u" C_RESET "\n",
+           st->stats.errors > 0 ? C_ERR : C_DIM, st->stats.errors);
+    printf("   Handles     " C_VALUE "%zu" C_RESET "\n", nexusObjectDbCount());
+}
+
+// The log view scrolls independently, so a long install can be read back.
+static void draw_log(u32 scroll)
+{
+    const size_t have = nexusLogGetLineCount();
+
+    printf("\n");
+    for (u32 row = 0; row < UI_BODY_ROWS; row++) {
+        // Index 0 is the newest line, so the window walks backwards from the
+        // scroll position and prints oldest-first within the page.
+        const size_t idx = scroll + (UI_BODY_ROWS - 1 - row);
+        char line[NEXUS_LOG_LINE_MAX];
+        if (nexusLogGetLine(idx, line, sizeof(line))) {
+            printf("   " C_DIM "%.*s" C_RESET "\n", UI_WIDTH - 5, line);
+        } else {
+            printf("\n");
+        }
+    }
+
+    if (have > UI_BODY_ROWS) {
+        printf("   " C_DIM "-- %zu lines, offset %u --" C_RESET "\n", have, scroll);
+    }
+}
+
+static void draw_about(void)
+{
+    // Deliberately plain ASCII: the console font is not guaranteed to carry
+    // box-drawing or block glyphs, and a broken banner looks worse than none.
+    printf("\n");
+    printf("   " C_TITLE "  _  ___  __  _  _ ___ __  _ _ ___ " C_RESET "\n");
+    printf("   " C_TITLE " | \\| \\ \\/ / | \\| | __|\\ \\/ / | / __|" C_RESET "\n");
+    printf("   " C_TITLE " | .` |>  <  | .` | _|  >  <| || \\__ \\" C_RESET "\n");
+    printf("   " C_TITLE " |_|\\_/_/\\_\\ |_|\\_|___|/_/\\_\\\\_,_|___/" C_RESET "\n");
+    printf("\n");
+    printf("   An open-source MTP server and streaming installer.\n\n");
+
+    printf("   Version       " C_VALUE "%s" C_RESET "\n", nexusUpdateVersion());
+    printf("   Booted from   " C_VALUE "%s" C_RESET "\n", nexusSysInfoStorageName());
+    printf("   Firmware      " C_VALUE "%s" C_RESET "\n",
+           nexusSysInfoFirmware()[0] != '\0' ? nexusSysInfoFirmware() : "unknown");
+    printf("   Network       %s\n",
+           nexusHttpIsReady() ? (nexusHttpHasCaBundle() ? "ready (TLS verified)"
+                                                        : "ready (no CA bundle)")
+                              : "unavailable");
+    printf("\n");
+    printf("   Copyright (C) 2026 NX-Nexus contributors.\n");
+    printf("   Free software under the GNU GPL, version 3 or later.\n");
+    printf("   This program comes with ABSOLUTELY NO WARRANTY.\n\n");
+    printf("   " C_DIM "Not affiliated with Nintendo. Contains no keys and no" C_RESET "\n");
+    printf("   " C_DIM "copyrighted Nintendo material." C_RESET "\n");
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+int main(int argc, char *argv[])
+{
+    (void)argc;
+    (void)argv;
+
+    consoleInit(NULL);
+
+    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+    PadState pad;
+    padInitializeDefault(&pad);
+
+    nexusLogInit(NexusLogLevel_Info);
+
+    // Which NAND we booted from decides how several stores label themselves,
+    // so this has to happen before the registry is built.
+    nexusSysInfoInit();
+
+    if (R_FAILED(psmInitialize())) LOG_W("psm: unavailable, battery will report 100");
+
+    int status = EXIT_SUCCESS;
+
+    bool install_ready = true;
+    if (R_FAILED(nexusInstallServicesInit())) {
+        LOG_W("init: install services unavailable, install stores disabled");
+        install_ready = false;
+    }
+
+    Result rc = nexusObjectDbInit();
+    if (R_FAILED(rc)) {
+        LOG_E("init: object db failed (0x%x)", rc);
+        status = EXIT_FAILURE;
+        goto cleanup_install;
+    }
+
+    rc = nexusStorageRegistryInit();
+    if (R_FAILED(rc)) {
+        LOG_E("init: storage registry failed (0x%x)", rc);
+        status = EXIT_FAILURE;
+        goto cleanup_objdb;
+    }
+
+    // Networking is only used on request, but the config decides TLS policy
+    // so it has to be read before any fetch happens.
+    if (R_SUCCEEDED(nexusHttpInit())) nexusSourcesLoad(NULL);
+    else LOG_W("init: networking unavailable, source and update features are off");
+
+    LOG_I("ready -- choose \"Start MTP server\" to expose the console over USB");
+
+    {
+        Screen screen = Screen_Main;
+        Menu   menu;
+        Menu   sub;                 // whichever sub-screen list is showing
+        u32    log_scroll = 0;
+
+        NexusMaintenanceReport report;
+        bool scanned = false;
+        memset(&report, 0, sizeof(report));
+        menuReset(&sub, UI_BODY_ROWS);
+
+        build_main_menu(&menu);
+
+        while (appletMainLoop()) {
+            padUpdate(&pad);
+            const u64 down = padGetButtonsDown(&pad);
+
+            if (down & HidNpadButton_Plus) break;
+
+            if (screen == Screen_Main) {
+                if (down & (HidNpadButton_Up   | HidNpadButton_StickLUp))   menuMove(&menu, -1);
+                if (down & (HidNpadButton_Down | HidNpadButton_StickLDown)) menuMove(&menu, 1);
+                if (down & HidNpadButton_L) menuPage(&menu, -1);
+                if (down & HidNpadButton_R) menuPage(&menu, 1);
+
+                if (down & HidNpadButton_A) {
+                    switch (menuSelectedId(&menu)) {
+                        case Act_ToggleServer:
+                            if (g_server_up) server_stop();
+                            else             server_start();
+                            build_main_menu(&menu);
+                            break;
+                        case Act_Stores:   screen = Screen_Stores;   break;
+                        case Act_Transfer: screen = Screen_Transfer; break;
+                        case Act_Log:      screen = Screen_Log; log_scroll = 0; break;
+                        case Act_About:    screen = Screen_About;    break;
+                        case Act_Quit:     screen = Screen_Quit;     break;
+
+                        case Act_Sources:
+                            g_action_msg[0] = 0;
+                            build_sources_menu(&sub);
+                            screen = Screen_Sources;
+                            break;
+
+                        case Act_Maintenance:
+                            scanned = false;
+                            g_action_msg[0] = 0;
+                            build_maintenance_menu(&sub);
+                            screen = Screen_Maintenance;
+                            break;
+
+                        case Act_Update:
+                            g_action_msg[0] = 0;
+                            build_update_menu(&sub);
+                            screen = Screen_Update;
+                            break;
+
+                        default: break;
+                    }
+                }
+            } else if (screen == Screen_Sources || screen == Screen_Items
+                       || screen == Screen_Maintenance || screen == Screen_Update) {
+
+                if (down & (HidNpadButton_Up   | HidNpadButton_StickLUp))   menuMove(&sub, -1);
+                if (down & (HidNpadButton_Down | HidNpadButton_StickLDown)) menuMove(&sub, 1);
+                if (down & HidNpadButton_L) menuPage(&sub, -1);
+                if (down & HidNpadButton_R) menuPage(&sub, 1);
+
+                if (down & HidNpadButton_B) {
+                    // The item list steps back to the source list; everything
+                    // else returns to the main menu.
+                    if (screen == Screen_Items) {
+                        g_action_msg[0] = 0;
+                        build_sources_menu(&sub);
+                        screen = Screen_Sources;
+                    } else {
+                        screen = Screen_Main;
+                        build_main_menu(&menu);
+                    }
+                }
+
+                if (down & HidNpadButton_A) {
+                    const int id = menuSelectedId(&sub);
+
+                    if (id >= Act_Item_Base) {
+                        const u32 idx = (u32)(id - Act_Item_Base);
+                        if (idx < g_item_count) {
+                            // Blocking on purpose: the screen says what is
+                            // happening, and the bytes go straight from the
+                            // socket into ncm with nothing staged on the SD.
+                            consoleClear();
+                            draw_header("Installing");
+                            printf("\n   %s\n\n", g_items[idx].name);
+                            printf("   Streaming from the network into ncm...\n");
+                            consoleUpdate(NULL);
+
+                            nexusNetInstall(g_items[idx].url, g_items[idx].name,
+                                            NET_INSTALL_TARGET);
+                            // Bound both halves so neither can push the other
+                            // out: the status is the part worth reading, and
+                            // the name only identifies which item it was.
+                            snprintf(g_action_msg, sizeof(g_action_msg), "%.40s: %.60s",
+                                     g_items[idx].name,
+                                     nexusNetInstallGetState()->status);
+                        }
+                    } else if (id >= Act_Source_Base) {
+                        const u32 idx = (u32)(id - Act_Source_Base);
+                        g_source_index = (int)idx;
+
+                        consoleClear();
+                        draw_header("Sources");
+                        printf("\n   Fetching index...\n");
+                        consoleUpdate(NULL);
+
+                        load_source_items(idx);
+                        build_items_menu(&sub);
+                        screen = Screen_Items;
+                    } else {
+                        switch (id) {
+                            case Act_Mnt_Scan:
+                                nexusMaintenanceScan(&report);
+                                scanned = true;
+                                snprintf(g_action_msg, sizeof(g_action_msg), "scan complete");
+                                break;
+
+                            case Act_Mnt_Placeholders: {
+                                u32 n = 0;
+                                nexusMaintenanceCleanPlaceholders(&n);
+                                snprintf(g_action_msg, sizeof(g_action_msg),
+                                         "cleared %u placeholder(s)", n);
+                                nexusMaintenanceScan(&report);
+                                scanned = true;
+                                break;
+                            }
+
+                            case Act_Mnt_Orphans:
+                                if (R_SUCCEEDED(nexusMaintenanceCleanOrphans(NULL))) {
+                                    snprintf(g_action_msg, sizeof(g_action_msg),
+                                             "removed redundant title data");
+                                } else {
+                                    snprintf(g_action_msg, sizeof(g_action_msg),
+                                             "nothing to remove, or not permitted");
+                                }
+                                nexusMaintenanceScan(&report);
+                                scanned = true;
+                                break;
+
+                            case Act_Upd_Check:
+                                consoleClear();
+                                draw_header("Update");
+                                printf("\n   Checking...\n");
+                                consoleUpdate(NULL);
+                                nexusUpdateCheck();
+                                build_update_menu(&sub);
+                                break;
+
+                            case Act_Upd_Apply:
+                                consoleClear();
+                                draw_header("Update");
+                                printf("\n   Downloading...\n");
+                                consoleUpdate(NULL);
+                                nexusUpdateApply();
+                                build_update_menu(&sub);
+                                break;
+
+                            default: break;
+                        }
+                    }
+                }
+
+            } else {
+                if (down & HidNpadButton_B) screen = Screen_Main;
+
+                if (screen == Screen_Log) {
+                    const size_t have = nexusLogGetLineCount();
+                    const u32 max_scroll = (have > UI_BODY_ROWS)
+                                         ? (u32)(have - UI_BODY_ROWS) : 0;
+
+                    if (down & (HidNpadButton_Up | HidNpadButton_StickLUp)) {
+                        if (log_scroll < max_scroll) log_scroll++;
+                    }
+                    if (down & (HidNpadButton_Down | HidNpadButton_StickLDown)) {
+                        if (log_scroll > 0) log_scroll--;
+                    }
+                    if (down & HidNpadButton_L) {
+                        log_scroll = (log_scroll + UI_BODY_ROWS < max_scroll)
+                                   ? log_scroll + UI_BODY_ROWS : max_scroll;
+                    }
+                    if (down & HidNpadButton_R) {
+                        log_scroll = (log_scroll > UI_BODY_ROWS)
+                                   ? log_scroll - UI_BODY_ROWS : 0;
+                    }
+                }
+            }
+
+            if (screen == Screen_Quit) break;
+
+            consoleClear();
+
+            switch (screen) {
+                case Screen_Main:
+                    draw_header("Main menu");
+                    printf("\n");
+                    menuDraw(&menu);
+                    draw_footer("[A] select   [Up/Down] move   [+] quit");
+                    break;
+
+                case Screen_Stores:
+                    draw_header("Stores");
+                    draw_stores();
+                    draw_footer("[B] back   [+] quit");
+                    break;
+
+                case Screen_Transfer:
+                    draw_header("Transfer");
+                    draw_transfer();
+                    draw_footer("[B] back   [+] quit");
+                    break;
+
+                case Screen_Sources:
+                    draw_header("Sources");
+                    draw_sources_intro();
+                    menuDraw(&sub);
+                    draw_message_block();
+                    draw_footer("[A] open   [B] back   [Up/Down] move");
+                    break;
+
+                case Screen_Items:
+                    draw_header("Install from source");
+                    printf("\n");
+                    menuDraw(&sub);
+                    draw_message_block();
+                    draw_footer("[A] install   [B] back   [Up/Down] move");
+                    break;
+
+                case Screen_Maintenance:
+                    draw_header("Maintenance");
+                    draw_maintenance(&report, scanned);
+                    menuDraw(&sub);
+                    draw_message_block();
+                    draw_footer("[A] run   [B] back   [Up/Down] move");
+                    break;
+
+                case Screen_Update:
+                    draw_header("Update");
+                    draw_update();
+                    printf("\n");
+                    menuDraw(&sub);
+                    draw_message_block();
+                    draw_footer("[A] run   [B] back   [Up/Down] move");
+                    break;
+
+                case Screen_Log:
+                    draw_header("Log");
+                    draw_log(log_scroll);
+                    draw_footer("[B] back   [Up/Down] scroll   [L/R] page");
+                    break;
+
+                case Screen_About:
+                    draw_header("About");
+                    draw_about();
+                    draw_footer("[B] back   [+] quit");
+                    break;
+
+                default:
+                    break;
+            }
+
+            consoleUpdate(NULL);
+            svcSleepThread(33000000ull);   // ~30 fps: responsive, not busy-waiting
+        }
+    }
+
+    server_stop();
+    free(g_items);
+    nexusHttpExit();
+    nexusStorageRegistryExit();
+
+cleanup_objdb:
+    nexusObjectDbExit();
+cleanup_install:
+    if (install_ready) nexusInstallServicesExit();
+    psmExit();
+
+    nexusLogExit();
+    consoleExit(NULL);
+    return status;
+}
